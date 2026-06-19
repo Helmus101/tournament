@@ -1,4 +1,4 @@
-"""Run realpong against a selected opponent using the code in new_v3."""
+"""Run realpong against a selected opponent using this self-contained folder."""
 
 from __future__ import annotations
 

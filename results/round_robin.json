@@ -1,0 +1,56 @@
+{
+  "games_per_pairing": 2,
+  "matches": [
+    {
+      "a": "realpong",
+      "b": "karpathy_pong",
+      "a_points": 44,
+      "b_points": 44,
+      "winner": "tie"
+    },
+    {
+      "a": "realpong",
+      "b": "ppo",
+      "a_points": 44,
+      "b_points": 44,
+      "winner": "tie"
+    },
+    {
+      "a": "karpathy_pong",
+      "b": "ppo",
+      "a_points": 44,
+      "b_points": 44,
+      "winner": "tie"
+    }
+  ],
+  "standings": [
+    {
+      "name": "realpong",
+      "wins": 0,
+      "losses": 0,
+      "ties": 2,
+      "points_for": 88,
+      "points_against": 88,
+      "diff": 0
+    },
+    {
+      "name": "karpathy_pong",
+      "wins": 0,
+      "losses": 0,
+      "ties": 2,
+      "points_for": 88,
+      "points_against": 88,
+      "diff": 0
+    },
+    {
+      "name": "ppo",
+      "wins": 0,
+      "losses": 0,
+      "ties": 2,
+      "points_for": 88,
+      "points_against": 88,
+      "diff": 0
+    }
+  ],
+  "champion": "realpong"
+}

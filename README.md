@@ -40,6 +40,29 @@ Run against `karpathy_pong` instead:
 pongenv/bin/python tournament/run_tournament.py --opponent karpathy_pong
 ```
 
+## Train
+
+Retrain `realpong` with the corrected curriculum:
+
+```bash
+pongenv/bin/python tournament/realpong.py
+```
+
+Retrain `karpathy_pong`:
+
+```bash
+pongenv/bin/python tournament/karpathy_pong.py
+```
+
+For a limited run:
+
+```bash
+pongenv/bin/python tournament/realpong.py --episodes 100
+```
+
+The trainer alternates sides, starts against `random`, only graduates after a
+stable rolling win rate, then moves through `mixed` to `ball_follower`.
+
 Save a custom result file:
 
 ```bash
