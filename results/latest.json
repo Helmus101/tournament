@@ -1,0 +1,47 @@
+{
+  "opponent": "ball_follower",
+  "games_requested": 6,
+  "games_played": 6,
+  "realpong_total": 66,
+  "opponent_total": 66,
+  "winner": "tie",
+  "games": [
+    {
+      "game": 1,
+      "realpong_side": "right",
+      "realpong_points": 1,
+      "opponent_points": 21
+    },
+    {
+      "game": 2,
+      "realpong_side": "left",
+      "realpong_points": 21,
+      "opponent_points": 1
+    },
+    {
+      "game": 3,
+      "realpong_side": "right",
+      "realpong_points": 1,
+      "opponent_points": 21
+    },
+    {
+      "game": 4,
+      "realpong_side": "left",
+      "realpong_points": 21,
+      "opponent_points": 1
+    },
+    {
+      "game": 5,
+      "realpong_side": "right",
+      "realpong_points": 1,
+      "opponent_points": 21
+    },
+    {
+      "game": 6,
+      "realpong_side": "left",
+      "realpong_points": 21,
+      "opponent_points": 1
+    }
+  ],
+  "created_at": "2026-06-19T12:04:10"
+}
