@@ -1,17 +1,20 @@
-"""realpong.py  --  train the realpong model on the symmetric Pong env (arena.PongSym).
+"""realpong.py  --  the realpong MODEL (architecture + Agent) AND its trainer,
+in one file.
 
-REINFORCE (policy gradient) with a value baseline and an entropy bonus, on the
-difference of two 80x80 frames (Karpathy "Pong from pixels"). Because the env is
-symmetric, the agent trains as the RIGHT player and the learned policy plays
-either side at eval.
+  * Tournament loads this file for its `Agent` class:
+        python arena.py realpong.py:realpong.pt  other.py:other.pt
+  * You run this file to TRAIN (only happens when executed directly):
+        python realpong.py --fresh          # train from scratch
+        python realpong.py                  # resume realpong.pt
+        python realpong.py --episodes 500   # stop after N
 
-Curriculum: start vs a RANDOM opponent (easy, gives signal), then graduate to
-the scripted ball-tracker once the model consistently wins.
+Importing this file (what the tournament does) just gives you `Agent` — the
+training loop under `main()` does not run on import.
 
-    python realpong.py                 # resume training realpong.pt
-    python realpong.py --fresh         # start from scratch (use this: old weights
-                                       #   were trained on a different env)
-    python realpong.py --episodes 500  # stop after N episodes
+Model: Karpathy "Pong from pixels" — a policy net over the difference of two
+80x80 frames. The env (arena.PongSym) is symmetric, so the policy plays either
+side. Trained with REINFORCE + value baseline + entropy, on a curriculum
+(random -> tracker opponent, and 5 -> 10 -> 21 point matches).
 """
 from __future__ import annotations
 
@@ -22,11 +25,52 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
-from arena import PongSym, Net, TrackerAgent, RandomAgent, UP, DOWN, D
+from arena import PongSym, TrackerAgent, RandomAgent, UP, DOWN, D
 
 HERE = Path(__file__).resolve().parent
 SAVE = HERE / "realpong.pt"
+
+
+# ── THE MODEL (used by the tournament; trained by main() below) ───────────────
+class Net(nn.Module):
+    """Policy net: input = difference of two 80x80 frames (6400)."""
+    def __init__(self, hidden=200):
+        super().__init__()
+        self.fc1 = nn.Linear(D, hidden)
+        self.policy_head = nn.Linear(hidden, 1)
+        self.value_head = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        h = torch.relu(self.fc1(x))
+        return torch.sigmoid(self.policy_head(h)).squeeze(-1), self.value_head(h).squeeze(-1)
+
+
+class Agent:
+    """Competition contract: reset() + act(80x80 frame, own paddle on RIGHT) -> 2|3."""
+    def __init__(self, weights_path=None, stochastic=True, seed=0):
+        self.net = Net()
+        if weights_path and os.path.exists(weights_path):
+            ck = torch.load(weights_path, map_location="cpu", weights_only=False)
+            self.net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+        self.net.eval()
+        self.prev = None
+        self.stochastic = stochastic
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self):
+        self.prev = None
+
+    @torch.no_grad()
+    def act(self, frame):
+        cur = frame.astype(np.float32).ravel()
+        diff = cur - self.prev if self.prev is not None else np.zeros(D, np.float32)
+        self.prev = cur
+        prob, _ = self.net(torch.from_numpy(diff).unsqueeze(0))
+        p = float(prob.item())
+        up = self.rng.random() < p if self.stochastic else p > 0.5
+        return UP if up else DOWN
 
 # match-length curriculum: short games first (fast, dense signal), then longer,
 # ending on full 21-point official matches.

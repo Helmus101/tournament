@@ -33,8 +33,6 @@ import os
 import sys
 
 import numpy as np
-import torch
-import torch.nn as nn
 
 # ── actions ────────────────────────────────────────────────────────────────────
 UP, DOWN, NOOP = 2, 3, 0
@@ -131,48 +129,11 @@ class PongSym:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NETWORK + AGENTS
+#  AGENTS  —  the arena is architecture-agnostic: every model brings its OWN code
+#  (a .py with an `Agent` class) plus its weights (.pt). Nothing here assumes a
+#  particular network. The only built-ins are two reference opponents.
 # ══════════════════════════════════════════════════════════════════════════════
 D = SIZE * SIZE
-
-
-class Net(nn.Module):
-    """Karpathy-style policy net: input = difference of two 80x80 frames (6400)."""
-    def __init__(self, hidden=200):
-        super().__init__()
-        self.fc1 = nn.Linear(D, hidden)
-        self.policy_head = nn.Linear(hidden, 1)
-        self.value_head = nn.Linear(hidden, 1)
-
-    def forward(self, x):
-        h = torch.relu(self.fc1(x))
-        return torch.sigmoid(self.policy_head(h)).squeeze(-1), self.value_head(h).squeeze(-1)
-
-
-class Agent:
-    """Standard agent: a trained Net that acts on the env's 80x80 frame.
-    Samples UP at P(UP) (stochastic) so seeded games vary naturally."""
-    def __init__(self, weights_path=None, stochastic=True, seed=0):
-        self.net = Net()
-        if weights_path and os.path.exists(weights_path):
-            ck = torch.load(weights_path, map_location="cpu", weights_only=False)
-            self.net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
-        self.net.eval()
-        self.prev = None
-        self.stochastic = stochastic
-        self.rng = np.random.default_rng(seed)
-
-    def reset(self): self.prev = None
-
-    @torch.no_grad()
-    def act(self, frame):
-        cur = frame.astype(np.float32).ravel()
-        diff = cur - self.prev if self.prev is not None else np.zeros(D, np.float32)
-        self.prev = cur
-        prob, _ = self.net(torch.from_numpy(diff).unsqueeze(0))
-        p = float(prob.item())
-        up = self.rng.random() < p if self.stochastic else p > 0.5
-        return UP if up else DOWN
 
 
 class TrackerAgent:
@@ -195,8 +156,26 @@ class RandomAgent:
     def act(self, frame): return int(self.rng.choice([UP, DOWN]))
 
 
-def load_custom(py_path, pt_path):
-    spec = importlib.util.spec_from_file_location("submission", py_path)
+def _resolve(path):
+    # Resolve relative to the tournament folder FIRST (where models live), so a
+    # bare name like "realpong.py" never accidentally matches a same-named file
+    # in the directory you happen to run from.
+    if not path:
+        return path
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, path)
+    if os.path.exists(cand):
+        return cand
+    return path        # fall back to the path as given (absolute or cwd-relative)
+
+
+def load_submission(py_path, pt_path):
+    """Import a competitor's module and build its Agent(weights). The module
+    carries the model's ORIGINAL code (architecture), so any design works."""
+    py_path = _resolve(py_path)
+    pt_path = _resolve(pt_path)
+    modname = "submission_" + os.path.basename(py_path).replace(".", "_")
+    spec = importlib.util.spec_from_file_location(modname, py_path)
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     return mod.Agent(pt_path)
 
@@ -204,16 +183,20 @@ def load_custom(py_path, pt_path):
 def make_agent(spec, seed):
     if spec == "bf":     return TrackerAgent()
     if spec == "random": return RandomAgent(seed)
-    if ":" in spec and spec.split(":")[0].endswith(".py"):
-        py, pt = spec.split(":", 1); return load_custom(py, pt)
-    path = spec if os.path.exists(spec) else os.path.join(os.path.dirname(os.path.abspath(__file__)), spec)
-    return Agent(path, seed=seed)
+    if ":" in spec:                       # model.py:weights.pt  (code + weights)
+        py, pt = spec.split(":", 1); return load_submission(py, pt)
+    if spec.endswith(".py"):              # code only, the module finds its own weights
+        return load_submission(spec, None)
+    raise SystemExit(
+        f"'{spec}': a model must bring its own code. Pass it as 'model.py:weights.pt' "
+        f"(see realpong_agent.py for the contract). Built-in opponents: 'bf', 'random'.")
 
 
 def short_name(spec):
     if spec in ("bf", "random"): return spec
-    base = spec.split(":")[0] if ":" in spec else spec
-    return os.path.splitext(os.path.basename(base))[0]
+    if ":" in spec:                       # name by the weights file -> e.g. realpong
+        return os.path.splitext(os.path.basename(spec.split(":", 1)[1]))[0]
+    return os.path.splitext(os.path.basename(spec))[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -278,68 +261,121 @@ def play_game(agent_r, agent_l, seed, viewer=None, nr="R", nl="L"):
     return env.score_r, env.score_l
 
 
-def run(specs, games, watch=False):
-    names = [short_name(s) for s in specs]
-    agents = {s: make_agent(s, seed=i + 1) for i, s in enumerate(specs)}
-    pts = {s: 0 for s in specs}
-    wins = {s: 0 for s in specs}               # match wins
-    gwins = {s: 0 for s in specs}              # individual-game wins
-    gplayed = {s: 0 for s in specs}
-    viewer = Viewer() if watch else None
+def _labels(specs):
+    """Display label per entrant; duplicate models get #1, #2, ... so two
+    entries of the same file are still counted as separate competitors."""
+    base = [short_name(s) for s in specs]
+    seen, out = {}, {}
+    for i, b in enumerate(base):
+        if base.count(b) > 1:
+            seen[b] = seen.get(b, 0) + 1
+            out[i] = f"{b}#{seen[b]}"
+        else:
+            out[i] = b
+    return out
 
+
+def _one_game(agents, label, ia, ib, seed, viewer, flip):
+    """Single game to 21 between entrants ia, ib. `flip` swaps who is the right
+    paddle (alternation); result is always returned as (score_a, score_b)."""
+    na, nb = label[ia], label[ib]
+    if not flip:
+        sr, sl = play_game(agents[ia], agents[ib], seed, viewer, na, nb)
+        return sr, sl
+    sr, sl = play_game(agents[ib], agents[ia], seed, viewer, nb, na)
+    return sl, sr
+
+
+def play_set(agents, label, ia, ib, seedbox, viewer, best_of):
+    """Best-of-N set, each game to 21. Returns the winning entrant index."""
+    na, nb = label[ia], label[ib]
+    need = best_of // 2 + 1                     # 2 game-wins for best-of-3
+    wa = wb = g = 0
+    print(f"  --- {na} vs {nb}  (best of {best_of}, games to 21) ---")
+    while wa < need and wb < need:
+        g += 1; seedbox[0] += 1
+        a, b = _one_game(agents, label, ia, ib, 1000 + seedbox[0], viewer, flip=(g % 2 == 0))
+        if a > b: wa += 1
+        else:     wb += 1
+        print(f"    game {g}: {na} {a:2d} - {b:2d} {nb}   (set {wa}-{wb})")
+    winner = ia if wa > wb else ib
+    print(f"    -> {label[winner]} wins the set\n")
+    return winner
+
+
+def tiebreak(group, agents, label, seedbox, viewer):
+    """Order entrants tied on points via single games to 21 among them."""
+    if len(group) <= 1:
+        return group
+    print(f"  *** TIEBREAK among {', '.join(label[i] for i in group)} (single game to 21) ***")
+    w = {i: 0 for i in group}
+    for ia, ib in itertools.combinations(group, 2):
+        seedbox[0] += 1
+        a, b = _one_game(agents, label, ia, ib, 7000 + seedbox[0], viewer, flip=False)
+        print(f"    tiebreak: {label[ia]} {a:2d} - {b:2d} {label[ib]}")
+        if a > b: w[ia] += 1
+        else:     w[ib] += 1
+    print()
+    return sorted(group, key=lambda i: w[i], reverse=True)
+
+
+def run(specs, best_of=3, watch=True):
+    ids = list(range(len(specs)))
+    agents = {i: make_agent(specs[i], seed=i + 1) for i in ids}   # keyed per ENTRANT
+    label = _labels(specs)
+    points = {i: 0 for i in ids}                # tournament points = sets won
+    seedbox = [0]
+    viewer = None
+    if watch:
+        try:
+            viewer = Viewer()
+        except Exception as e:
+            print(f"[no display available, running headless: {e}]")
+
+    order = list(ids)
     try:
-        for sa, sb in itertools.combinations(specs, 2):
-            na, nb = short_name(sa), short_name(sb)
-            print("=" * 56)
-            print(f"  {na}  vs  {nb}   ({games} games)")
-            print("=" * 56)
-            pa = pb = 0
-            for g in range(1, games + 1):
-                # symmetric env, but alternate sides anyway as belt-and-braces fairness
-                if g % 2 == 1:
-                    sr, sl = play_game(agents[sa], agents[sb], 1000 + g, viewer, na, nb); ga, gb = sr, sl
-                else:
-                    sr, sl = play_game(agents[sb], agents[sa], 1000 + g, viewer, nb, na); ga, gb = sl, sr
-                pa += ga; pb += gb
-                gplayed[sa] += 1; gplayed[sb] += 1
-                if ga > gb:   gwins[sa] += 1
-                elif gb > ga: gwins[sb] += 1
-                print(f"  game {g:2d}/{games}  {na} {ga:2d} - {gb:2d} {nb}   (total {pa}-{pb})")
-            pts[sa] += pa; pts[sb] += pb
-            if pa > pb: wins[sa] += 1
-            elif pb > pa: wins[sb] += 1
-            print("-" * 56)
-            print(f"  {na} {pa} - {pb} {nb}\n")
+        print("=" * 56)
+        print(f"  ROUND-ROBIN  ({len(ids)} agents, best of {best_of} to 21, set win = 1 pt)")
+        print("=" * 56)
+        for ia, ib in itertools.combinations(ids, 2):
+            points[play_set(agents, label, ia, ib, seedbox, viewer, best_of)] += 1
+
+        # rank by points; break any ties with single games to 21
+        order = []
+        for p in sorted(set(points.values()), reverse=True):
+            group = [i for i in ids if points[i] == p]
+            order.extend(tiebreak(group, agents, label, seedbox, viewer))
     except KeyboardInterrupt:
         print("\n[interface closed early]")
+        order = sorted(ids, key=lambda i: points[i], reverse=True)
     finally:
         if viewer: viewer.close()
 
-    ranking = sorted(specs, key=lambda s: (wins[s], pts[s]), reverse=True)
     print("=" * 56)
     print("  FINAL STANDINGS")
     print("=" * 56)
-    print(f"  {'#':<3}{'model':<18}{'wins':>6}{'points':>8}{'winrate':>9}")
-    print("  " + "-" * 52)
-    for i, s in enumerate(ranking, 1):
-        wr = (gwins[s] / gplayed[s] * 100) if gplayed[s] else 0.0
-        print(f"  {i:<3}{short_name(s):<18}{wins[s]:>6}{pts[s]:>8}{wr:>8.0f}%")
+    print(f"  {'#':<3}{'model':<20}{'points':>8}")
+    print("  " + "-" * 44)
+    for rank, i in enumerate(order, 1):
+        print(f"  {rank:<3}{label[i]:<20}{points[i]:>8}")
     print("=" * 56)
-    print(f"  CHAMPION: {short_name(ranking[0])}")
+    print(f"  CHAMPION: {label[order[0]]}")
     print("=" * 56)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Symmetric Pong tournament.")
     ap.add_argument("models", nargs="*", help="model.pt | bf | random | file.py:weights.pt")
-    ap.add_argument("--games", type=int, default=11, help="games per pairing (default 11)")
-    ap.add_argument("--watch", action="store_true", help="open a window and watch the games live")
+    ap.add_argument("--best-of", type=int, default=3, dest="best_of",
+                    help="games per set, each to 21 (default 3)")
+    ap.add_argument("--headless", action="store_true", help="run without the visual window (text only)")
+    ap.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)  # legacy no-op (visual is default)
     args = ap.parse_args()
 
-    specs = args.models or ["realpong.pt", "bf"]
+    specs = args.models or ["realpong.py:realpong.pt", "bf"]
     if len(specs) < 2:
         specs = specs + ["bf"]
-    run(specs, args.games, watch=args.watch)
+    run(specs, best_of=args.best_of, watch=not args.headless)   # visual ON by default
 
 
 if __name__ == "__main__":

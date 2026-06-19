@@ -1,15 +1,16 @@
 # Pong Tournament
 
 A clean, symmetric Pong environment with a self-play trainer and a fair
-round-robin tournament. Two files of code, one model.
+round-robin tournament.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `arena.py` | **Everything for running:** the symmetric `PongSym` environment, the policy network, the agent contract, and the tournament. Run it to hold a tournament. |
-| `realpong.py` | Trainer — trains `realpong.pt` on `PongSym`. |
-| `realpong.pt` | The trained weights. |
+| `arena.py` | The symmetric `PongSym` environment + the tournament runner. **Architecture-agnostic** — it never assumes a network; every model brings its own code. Built-in opponents: `bf` (tracker), `random`. |
+| `realpong.py` | The realpong **model** (`Net` + `Agent` class) **and** its trainer, in one file. The tournament imports it for the `Agent`; running it directly trains. |
+| `realpong.pt` | realpong's trained weights. |
+| `submission_template.py` | Copy-paste starting point for a competitor's entry (a working `Agent`). |
 | `requirements.txt` | Dependencies. |
 
 ## Setup
@@ -22,36 +23,50 @@ source pongenv/bin/activate          # so `python` has torch/numpy
 ## Run a tournament
 
 ```bash
-python tournament/arena.py                          # realpong.pt vs the scripted tracker
-python tournament/arena.py realpong.pt bf random    # add reference opponents
-python tournament/arena.py realpong.pt alice.pt     # any number of models
-python tournament/arena.py --games 21               # games per pairing
-python tournament/arena.py --watch                  # open a window and WATCH the games live
-python tournament/arena.py realpong.pt bf --watch --games 1   # watch one game
+python tournament/arena.py                                          # realpong vs the tracker (default)
+python tournament/arena.py realpong.py:realpong.pt alice.py:alice.pt bob.py:bob.pt   # 3 entrants
+python tournament/arena.py realpong.py:realpong.pt bf random        # add reference opponents
+python tournament/arena.py --best-of 5                              # longer sets (default 3)
+python tournament/arena.py --headless                               # text only, no window
 ```
 
-`--watch` opens a pygame window (green = right paddle, orange = left, yellow =
-ball). Up/Down change speed, Esc quits.
+### Format
+- **Round-robin:** every entrant plays every other.
+- Each pairing is a **best-of-3 set**, each game to **21 points**.
+- **Winning the set = 1 tournament point.**
+- Final ranking is by **points**. If two (or more) are tied, they play a single
+  **game to 21** to break it.
+
+A **visual window opens by default** (green = right paddle, orange = left, yellow
+= ball). Up/Down change speed, Esc quits. Use `--headless` to run text-only (or
+if there's no display, it falls back to text automatically).
+
+Each model is given as `code.py:weights.pt`. `bf` (scripted tracker) and
+`random` are the only built-in opponents and need no files.
 
 ## Add your own model
 
-1. **Standard network** — drop a `.pt` file (a `state_dict` for `arena.Net`) in
-   this folder and pass its name:
-   ```bash
-   python tournament/arena.py realpong.pt yourmodel.pt
-   ```
-2. **Custom architecture** — put an `Agent` class in your own `.py` file and pass
-   `yourfile.py:yourweights.pt`:
-   ```python
-   class Agent:
-       def __init__(self, weights_path=None): ...
-       def reset(self): ...                 # start of each game
-       def act(self, frame) -> int:         # frame: 80x80 float, own paddle on the RIGHT
-           ...                               # return 2 (UP) or 3 (DOWN)
-   ```
-   ```bash
-   python tournament/arena.py realpong.pt yourfile.py:yourweights.pt
-   ```
+The arena assumes **no architecture** — every model brings its own code, so any
+design (MLP, CNN, anything) can compete. A model = **two files**: a `.py` with
+your `Agent` class (your original model code) and a `.pt` of weights.
+
+```python
+# yourmodel.py
+class Agent:
+    def __init__(self, weights_path=None):   # build YOUR network, load the weights
+        ...
+    def reset(self): ...                      # called at the start of each game
+    def act(self, frame) -> int:              # frame: 80x80 float, own paddle on the RIGHT
+        ...                                    # return 2 (UP) or 3 (DOWN)
+```
+
+```bash
+python tournament/arena.py realpong.py:realpong.pt yourmodel.py:yourmodel.pt
+```
+
+`realpong.py` is a complete worked example of this contract (its `Agent` class is
+near the top). A bare `.pt` is **not** enough on its own — weights have no
+architecture, so you must ship the `.py` too.
 
 ## Train
 
