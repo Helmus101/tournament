@@ -78,7 +78,7 @@ python tournament/realpong.py --episodes 500 # stop after N
 
 Trains as the right player (symmetric env → plays both sides). Two curricula run
 together:
-- **opponent:** `random` → scripted `tracker` only after a **98% win rate** vs random
+- **opponent:** `random` → scripted ball-follower (`tracker`) after an **80% win rate** vs random
 - **match length:** episodes `<1000` are 5-point matches, `1000–4999` are
   10-point, `≥5000` are full **21-point official** matches
 

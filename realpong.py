@@ -36,9 +36,10 @@ SAVE = HERE / "realpong.pt"
 # ── THE MODEL (used by the tournament; trained by main() below) ───────────────
 class Net(nn.Module):
     """Policy net: input = difference of two 80x80 frames (6400)."""
-    def __init__(self, hidden=200):
+    def __init__(self, hidden=256):
         super().__init__()
-        self.fc1 = nn.Linear(D, hidden)
+        # input = [current frame (position) , current - previous (motion)] = 2*D
+        self.fc1 = nn.Linear(2 * D, hidden)
         self.policy_head = nn.Linear(hidden, 1)
         self.value_head = nn.Linear(hidden, 1)
 
@@ -47,13 +48,25 @@ class Net(nn.Module):
         return torch.sigmoid(self.policy_head(h)).squeeze(-1), self.value_head(h).squeeze(-1)
 
 
+def features(cur, prev):
+    """Network input: current frame (absolute position) + the motion (diff).
+    Pure diff hides where a stationary paddle is; the current frame restores it."""
+    diff = cur - prev if prev is not None else np.zeros(D, np.float32)
+    return np.concatenate([cur, diff]).astype(np.float32)
+
+
 class Agent:
     """Competition contract: reset() + act(80x80 frame, own paddle on RIGHT) -> 2|3."""
     def __init__(self, weights_path=None, stochastic=True, seed=0):
         self.net = Net()
         if weights_path and os.path.exists(weights_path):
             ck = torch.load(weights_path, map_location="cpu", weights_only=False)
-            self.net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+            try:
+                self.net.load_state_dict(state)
+            except RuntimeError:
+                print(f"[warning] {weights_path} doesn't fit this model (architecture changed) "
+                      f"-> using random weights. Retrain with: python realpong.py --fresh")
         self.net.eval()
         self.prev = None
         self.stochastic = stochastic
@@ -65,9 +78,9 @@ class Agent:
     @torch.no_grad()
     def act(self, frame):
         cur = frame.astype(np.float32).ravel()
-        diff = cur - self.prev if self.prev is not None else np.zeros(D, np.float32)
+        x = features(cur, self.prev)
         self.prev = cur
-        prob, _ = self.net(torch.from_numpy(diff).unsqueeze(0))
+        prob, _ = self.net(torch.from_numpy(x).unsqueeze(0))
         p = float(prob.item())
         up = self.rng.random() < p if self.stochastic else p > 0.5
         return UP if up else DOWN
@@ -89,10 +102,10 @@ batch_size    = 16         # episodes accumulated per optimizer step
 learning_rate = 1e-3
 gamma         = 0.99
 value_coef    = 0.5
-entropy_coef  = 0.01
+entropy_coef  = 0.005      # lower -> lets the policy sharpen instead of staying ~random
 grad_clip     = 1.0
-graduate_winrate = 0.98    # must win 98% vs the current opponent before graduating
-window        = 50
+graduate_winrate = 0.80    # win 80% vs random before graduating to the ball-follower
+window        = 100        # win rate & accuracy are over the last 100 episodes
 
 
 def discount(rewards):
@@ -113,10 +126,10 @@ def play_episode(net, opponent, seed, points):
     hits = misses = 0          # ball arrivals at OUR paddle: returned vs missed
     done = False
     while not done:
-        cur = obs["right"].ravel()
-        diff = cur - prev if prev is not None else np.zeros(D, np.float32)
+        cur = obs["right"].ravel().astype(np.float32)
+        x = features(cur, prev)
         prev = cur
-        prob, value = net(torch.from_numpy(diff).unsqueeze(0))
+        prob, value = net(torch.from_numpy(x).unsqueeze(0))
         prob = prob.squeeze(0); value = value.squeeze(0)
         up = torch.rand(()) < prob
         action = UP if up.item() else DOWN
@@ -144,11 +157,14 @@ def main():
     mode = "random"
     if SAVE.exists() and not args.fresh:
         ck = torch.load(SAVE, map_location="cpu", weights_only=False)
-        net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
-        if isinstance(ck, dict) and "optimizer" in ck: opt.load_state_dict(ck["optimizer"])
-        episode = int(ck.get("episode", 0)) if isinstance(ck, dict) else 0
-        mode = ck.get("mode", "random") if isinstance(ck, dict) else "random"
-        print(f"resumed realpong.pt at episode {episode} (opponent: {mode})")
+        try:
+            net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            if isinstance(ck, dict) and "optimizer" in ck: opt.load_state_dict(ck["optimizer"])
+            episode = int(ck.get("episode", 0)) if isinstance(ck, dict) else 0
+            mode = ck.get("mode", "random") if isinstance(ck, dict) else "random"
+            print(f"resumed realpong.pt at episode {episode} (opponent: {mode})")
+        except (RuntimeError, ValueError):
+            print("existing realpong.pt is from the OLD model architecture -> starting fresh")
     else:
         print("fresh realpong (symmetric env)")
 
@@ -195,7 +211,7 @@ def main():
             arrivals = sum(recent_hits) + sum(recent_misses)
             accuracy = (sum(recent_hits) / arrivals) if arrivals else 0.0   # return rate
             print(f"ep {episode:5d} | {points:2d}pt | {sr}-{sl} | reward {reward_sum:+3.0f} "
-                  f"| win {winrate*100:4.0f}% | acc {accuracy*100:4.0f}% | opp {mode}")
+                  f"| win(100) {winrate*100:4.0f}% | acc(100) {accuracy*100:4.0f}% | opp {mode}")
 
             if mode == "random" and len(recent_wins) == window and winrate >= graduate_winrate:
                 mode = "tracker"; recent.clear(); recent_wins.clear()

@@ -319,12 +319,15 @@ def tiebreak(group, agents, label, seedbox, viewer):
     return sorted(group, key=lambda i: w[i], reverse=True)
 
 
-def run(specs, best_of=3, watch=True):
+def run(specs, best_of=3, watch=True, seed=None):
+    # Random base seed each run, so serve directions differ every time you run it.
+    # Pass --seed for a reproducible tournament.
+    base = seed if seed is not None else int.from_bytes(os.urandom(4), "little")
     ids = list(range(len(specs)))
-    agents = {i: make_agent(specs[i], seed=i + 1) for i in ids}   # keyed per ENTRANT
+    agents = {i: make_agent(specs[i], seed=base + i + 1) for i in ids}   # keyed per ENTRANT
     label = _labels(specs)
     points = {i: 0 for i in ids}                # tournament points = sets won
-    seedbox = [0]
+    seedbox = [base]
     viewer = None
     if watch:
         try:
@@ -369,13 +372,14 @@ def main():
     ap.add_argument("--best-of", type=int, default=3, dest="best_of",
                     help="games per set, each to 21 (default 3)")
     ap.add_argument("--headless", action="store_true", help="run without the visual window (text only)")
+    ap.add_argument("--seed", type=int, default=None, help="fixed seed for a reproducible tournament")
     ap.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)  # legacy no-op (visual is default)
     args = ap.parse_args()
 
     specs = args.models or ["realpong.py:realpong.pt", "bf"]
     if len(specs) < 2:
         specs = specs + ["bf"]
-    run(specs, best_of=args.best_of, watch=not args.headless)   # visual ON by default
+    run(specs, best_of=args.best_of, watch=not args.headless, seed=args.seed)   # visual ON by default
 
 
 if __name__ == "__main__":
