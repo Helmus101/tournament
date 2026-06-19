@@ -41,26 +41,34 @@ class BallFollowerAgent:
 
 
 @dataclass
-class GameResult:
-    game: int
+class LegResult:
     realpong_side: str
     realpong_points: int
     opponent_points: int
 
 
 @dataclass
+class GameResult:
+    game: int
+    realpong_points: int
+    opponent_points: int
+    legs: list[LegResult]
+
+
+@dataclass
 class TournamentResult:
     opponent: str
     games_requested: int
-    games_played: int
+    fair_games_played: int
+    atari_legs_played: int
     realpong_total: int
     opponent_total: int
     winner: str
     games: list[GameResult]
 
 
-def play_game(env, right_agent, left_agent) -> tuple[int, int]:
-    """Play one Atari Pong game.
+def play_leg(env, right_agent, left_agent) -> tuple[int, int]:
+    """Play one Atari Pong leg.
 
     Returns:
         A tuple of (right_score, left_score). The right paddle is `first_0`.
@@ -72,9 +80,10 @@ def play_game(env, right_agent, left_agent) -> tuple[int, int]:
     left_score = 0
 
     while env.agents and max(right_score, left_score) < POINTS_TO_WIN:
-        frame = obs["first_0"]
-        right_action = right_agent.act(frame)
-        left_action = left_agent.act(frame[:, ::-1, :])
+        right_frame = obs["first_0"]
+        left_frame = obs["second_0"][:, ::-1, :]
+        right_action = right_agent.act(right_frame)
+        left_action = left_agent.act(left_frame)
         obs, rewards, _, _, _ = env.step(
             {"first_0": right_action, "second_0": left_action}
         )
@@ -103,10 +112,8 @@ def run_tournament(games: int, opponent_name: str) -> TournamentResult:
     from agent_ale import Agent
 
     games_requested = games
-    if games < 2:
-        raise ValueError("games must be at least 2")
-    if games % 2:
-        games += 1
+    if games < 1:
+        raise ValueError("games must be at least 1")
 
     realpong = Agent(str(TOURNAMENT_DIR / "realpong.pt"))
     opponent = make_opponent(opponent_name)
@@ -118,25 +125,31 @@ def run_tournament(games: int, opponent_name: str) -> TournamentResult:
 
     try:
         for game_number in range(1, games + 1):
-            if game_number % 2:
-                right_score, left_score = play_game(env, realpong, opponent)
-                realpong_points = right_score
-                opponent_points = left_score
-                realpong_side = "right"
-            else:
-                right_score, left_score = play_game(env, opponent, realpong)
-                realpong_points = left_score
-                opponent_points = right_score
-                realpong_side = "left"
+            right_score, left_score = play_leg(env, realpong, opponent)
+            right_leg = LegResult(
+                realpong_side="right",
+                realpong_points=right_score,
+                opponent_points=left_score,
+            )
+
+            right_score, left_score = play_leg(env, opponent, realpong)
+            left_leg = LegResult(
+                realpong_side="left",
+                realpong_points=left_score,
+                opponent_points=right_score,
+            )
+
+            realpong_points = right_leg.realpong_points + left_leg.realpong_points
+            opponent_points = right_leg.opponent_points + left_leg.opponent_points
 
             realpong_total += realpong_points
             opponent_total += opponent_points
             game_results.append(
                 GameResult(
                     game=game_number,
-                    realpong_side=realpong_side,
                     realpong_points=realpong_points,
                     opponent_points=opponent_points,
+                    legs=[right_leg, left_leg],
                 )
             )
     finally:
@@ -152,7 +165,8 @@ def run_tournament(games: int, opponent_name: str) -> TournamentResult:
     return TournamentResult(
         opponent=opponent_name,
         games_requested=games_requested,
-        games_played=games,
+        fair_games_played=games,
+        atari_legs_played=games * 2,
         realpong_total=realpong_total,
         opponent_total=opponent_total,
         winner=winner,
@@ -169,12 +183,14 @@ def write_result(result: TournamentResult, output_path: Path) -> None:
 
 def print_summary(result: TournamentResult, output_path: Path | None) -> None:
     print("=" * 64)
-    print(f"realpong vs {result.opponent} ({result.games_played} games)")
+    print(
+        f"realpong vs {result.opponent} "
+        f"({result.fair_games_played} fair games, {result.atari_legs_played} Atari legs)"
+    )
     print("=" * 64)
     for game in result.games:
         print(
-            f"game {game.game:02d} | realpong {game.realpong_side:>5} | "
-            f"realpong {game.realpong_points:2d} - "
+            f"fair game {game.game:02d} | realpong {game.realpong_points:2d} - "
             f"{game.opponent_points:2d} {result.opponent}"
         )
     print("-" * 64)
@@ -201,7 +217,10 @@ def parse_args() -> argparse.Namespace:
         "--games",
         type=int,
         default=DEFAULT_GAMES,
-        help=f"Number of games to play. Odd numbers are rounded up. Default: {DEFAULT_GAMES}",
+        help=(
+            "Number of fair games to play. Each fair game has two Atari legs, "
+            f"one on each side. Default: {DEFAULT_GAMES}"
+        ),
     )
     parser.add_argument(
         "--output",

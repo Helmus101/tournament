@@ -14,9 +14,9 @@ Available opponents:
 - `ball_follower`, a scripted paddle that tracks the ball
 - `karpathy_pong` using `karpathy_pong.pt`
 
-The match alternates sides every game because Atari Pong gives the two paddles
-different starting conditions. The winner is decided by total points across all
-games.
+Each reported game is a fair game made of two Atari legs: one leg with `realpong`
+on the right paddle and one leg with `realpong` on the left paddle. This removes
+the `pong_v3` side bias from the tournament score.
 
 ## Run
 
@@ -28,7 +28,7 @@ pongenv/bin/python tournament/run_tournament.py
 
 By default this runs `realpong` against `ball_follower`.
 
-Use a different number of games:
+Use a different number of fair games:
 
 ```bash
 pongenv/bin/python tournament/run_tournament.py --games 10
