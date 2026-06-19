@@ -87,23 +87,25 @@ class PongSym:
         elif self.by >= SIZE - 1:  self.by = SIZE - 1.0;   self.bvy = -abs(self.bvy)
 
         reward_r = 0.0
+        hit_r = hit_l = miss_r = miss_l = False
         if self.bx <= PADDLE_X_L + 1:
             if self.pad_l <= self.by <= self.pad_l + PADDLE_H:
-                self.bx = PADDLE_X_L + 1; self._bounce(self.pad_l)
+                self.bx = PADDLE_X_L + 1; self._bounce(self.pad_l); hit_l = True
             elif self.bx < 0:
-                reward_r = 1.0
+                reward_r = 1.0; miss_l = True
         elif self.bx >= PADDLE_X_R - 1:
             if self.pad_r <= self.by <= self.pad_r + PADDLE_H:
-                self.bx = PADDLE_X_R - 1; self._bounce(self.pad_r)
+                self.bx = PADDLE_X_R - 1; self._bounce(self.pad_r); hit_r = True
             elif self.bx > SIZE - 1:
-                reward_r = -1.0
+                reward_r = -1.0; miss_r = True
 
         if reward_r > 0:   self.score_r += 1; self._serve()
         elif reward_r < 0: self.score_l += 1; self._serve()
 
         self.steps += 1
         done = max(self.score_r, self.score_l) >= self.points or self.steps >= MAX_STEPS
-        return self._obs(), {"right": reward_r, "left": -reward_r}, done
+        info = {"hit_r": hit_r, "hit_l": hit_l, "miss_r": miss_r, "miss_l": miss_l}
+        return self._obs(), {"right": reward_r, "left": -reward_r}, done, info
 
     def _move(self, side, action):
         d = -PADDLE_SPEED if action == UP else PADDLE_SPEED if action == DOWN else 0.0
@@ -217,48 +219,111 @@ def short_name(spec):
 # ══════════════════════════════════════════════════════════════════════════════
 #  TOURNAMENT
 # ══════════════════════════════════════════════════════════════════════════════
-def play_game(agent_r, agent_l, seed):
+class Viewer:
+    """Optional pygame window that shows the games live. Up/Down = speed, Esc = quit."""
+    def __init__(self):
+        import pygame
+        self.pg = pygame
+        pygame.init()
+        self.scale = 7
+        self.ox, self.oy = 50, 70
+        self.W = SIZE * self.scale + 2 * self.ox
+        self.H = SIZE * self.scale + self.oy + 40
+        self.screen = pygame.display.set_mode((self.W, self.H))
+        pygame.display.set_caption("Pong arena")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("Courier New", 24, bold=True)
+        self.small = pygame.font.SysFont("Courier New", 14)
+        self.fps = 90
+
+    def pump(self):
+        for e in self.pg.event.get():
+            if e.type == self.pg.QUIT: return False
+            if e.type == self.pg.KEYDOWN:
+                if e.key == self.pg.K_ESCAPE: return False
+                if e.key == self.pg.K_UP:   self.fps = min(self.fps + 30, 480)
+                if e.key == self.pg.K_DOWN: self.fps = max(self.fps - 30, 30)
+        return True
+
+    def draw(self, env, nr, nl, sr, sl):
+        pg, s, sc = self.pg, self.screen, self.scale
+        gx, gy, gw, gh = self.ox, self.oy, SIZE * sc, SIZE * sc
+        s.fill((12, 12, 20))
+        pg.draw.rect(s, (20, 24, 36), (gx, gy, gw, gh))
+        pg.draw.rect(s, (50, 55, 75), (gx, gy, gw, gh), 2)
+        pg.draw.rect(s, (80, 200, 90), (gx + PADDLE_X_R * sc, gy + int(env.pad_r) * sc, sc, PADDLE_H * sc))
+        pg.draw.rect(s, (220, 120, 50), (gx + PADDLE_X_L * sc, gy + int(env.pad_l) * sc, sc, PADDLE_H * sc))
+        pg.draw.rect(s, (255, 230, 80), (gx + int(env.bx) * sc, gy + int(env.by) * sc, sc, sc))
+        s.blit(self.font.render(f"{nl} {sl}", True, (220, 120, 50)), (gx, 22))
+        t = self.font.render(f"{sr} {nr}", True, (80, 200, 90)); s.blit(t, (gx + gw - t.get_width(), 22))
+        s.blit(self.small.render(f"speed {self.fps}fps   Up/Down   Esc quit", True, (120, 120, 140)),
+               (gx, gy + gh + 8))
+        pg.display.flip()
+        self.clock.tick(self.fps)
+
+    def close(self): self.pg.quit()
+
+
+def play_game(agent_r, agent_l, seed, viewer=None, nr="R", nl="L"):
     env = PongSym(seed=seed)
     obs = env.reset(seed=seed)
     agent_r.reset(); agent_l.reset()
     done = False
     while not done:
-        obs, _, done = env.step(agent_r.act(obs["right"]), agent_l.act(obs["left"]))
+        if viewer and not viewer.pump():
+            raise KeyboardInterrupt
+        obs, _, done, _ = env.step(agent_r.act(obs["right"]), agent_l.act(obs["left"]))
+        if viewer:
+            viewer.draw(env, nr, nl, env.score_r, env.score_l)
     return env.score_r, env.score_l
 
 
-def run(specs, games):
+def run(specs, games, watch=False):
     names = [short_name(s) for s in specs]
     agents = {s: make_agent(s, seed=i + 1) for i, s in enumerate(specs)}
     pts = {s: 0 for s in specs}
-    wins = {s: 0 for s in specs}
+    wins = {s: 0 for s in specs}               # match wins
+    gwins = {s: 0 for s in specs}              # individual-game wins
+    gplayed = {s: 0 for s in specs}
+    viewer = Viewer() if watch else None
 
-    for sa, sb in itertools.combinations(specs, 2):
-        na, nb = short_name(sa), short_name(sb)
-        print("=" * 56)
-        print(f"  {na}  vs  {nb}   ({games} games)")
-        print("=" * 56)
-        pa = pb = 0
-        for g in range(1, games + 1):
-            # symmetric env, but alternate sides anyway as belt-and-braces fairness
-            if g % 2 == 1: sr, sl = play_game(agents[sa], agents[sb], 1000 + g); ga, gb = sr, sl
-            else:          sr, sl = play_game(agents[sb], agents[sa], 1000 + g); ga, gb = sl, sr
-            pa += ga; pb += gb
-            print(f"  game {g:2d}/{games}  {na} {ga:2d} - {gb:2d} {nb}   (total {pa}-{pb})")
-        pts[sa] += pa; pts[sb] += pb
-        if pa > pb: wins[sa] += 1
-        elif pb > pa: wins[sb] += 1
-        print("-" * 56)
-        print(f"  {na} {pa} - {pb} {nb}\n")
+    try:
+        for sa, sb in itertools.combinations(specs, 2):
+            na, nb = short_name(sa), short_name(sb)
+            print("=" * 56)
+            print(f"  {na}  vs  {nb}   ({games} games)")
+            print("=" * 56)
+            pa = pb = 0
+            for g in range(1, games + 1):
+                # symmetric env, but alternate sides anyway as belt-and-braces fairness
+                if g % 2 == 1:
+                    sr, sl = play_game(agents[sa], agents[sb], 1000 + g, viewer, na, nb); ga, gb = sr, sl
+                else:
+                    sr, sl = play_game(agents[sb], agents[sa], 1000 + g, viewer, nb, na); ga, gb = sl, sr
+                pa += ga; pb += gb
+                gplayed[sa] += 1; gplayed[sb] += 1
+                if ga > gb:   gwins[sa] += 1
+                elif gb > ga: gwins[sb] += 1
+                print(f"  game {g:2d}/{games}  {na} {ga:2d} - {gb:2d} {nb}   (total {pa}-{pb})")
+            pts[sa] += pa; pts[sb] += pb
+            if pa > pb: wins[sa] += 1
+            elif pb > pa: wins[sb] += 1
+            print("-" * 56)
+            print(f"  {na} {pa} - {pb} {nb}\n")
+    except KeyboardInterrupt:
+        print("\n[interface closed early]")
+    finally:
+        if viewer: viewer.close()
 
     ranking = sorted(specs, key=lambda s: (wins[s], pts[s]), reverse=True)
     print("=" * 56)
     print("  FINAL STANDINGS")
     print("=" * 56)
-    print(f"  {'#':<3}{'model':<18}{'wins':>6}{'points':>8}")
-    print("  " + "-" * 46)
+    print(f"  {'#':<3}{'model':<18}{'wins':>6}{'points':>8}{'winrate':>9}")
+    print("  " + "-" * 52)
     for i, s in enumerate(ranking, 1):
-        print(f"  {i:<3}{short_name(s):<18}{wins[s]:>6}{pts[s]:>8}")
+        wr = (gwins[s] / gplayed[s] * 100) if gplayed[s] else 0.0
+        print(f"  {i:<3}{short_name(s):<18}{wins[s]:>6}{pts[s]:>8}{wr:>8.0f}%")
     print("=" * 56)
     print(f"  CHAMPION: {short_name(ranking[0])}")
     print("=" * 56)
@@ -268,12 +333,13 @@ def main():
     ap = argparse.ArgumentParser(description="Symmetric Pong tournament.")
     ap.add_argument("models", nargs="*", help="model.pt | bf | random | file.py:weights.pt")
     ap.add_argument("--games", type=int, default=11, help="games per pairing (default 11)")
+    ap.add_argument("--watch", action="store_true", help="open a window and watch the games live")
     args = ap.parse_args()
 
     specs = args.models or ["realpong.pt", "bf"]
     if len(specs) < 2:
         specs = specs + ["bf"]
-    run(specs, args.games)
+    run(specs, args.games, watch=args.watch)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,12 @@ python tournament/arena.py                          # realpong.pt vs the scripte
 python tournament/arena.py realpong.pt bf random    # add reference opponents
 python tournament/arena.py realpong.pt alice.pt     # any number of models
 python tournament/arena.py --games 21               # games per pairing
+python tournament/arena.py --watch                  # open a window and WATCH the games live
+python tournament/arena.py realpong.pt bf --watch --games 1   # watch one game
 ```
+
+`--watch` opens a pygame window (green = right paddle, orange = left, yellow =
+ball). Up/Down change speed, Esc quits.
 
 ## Add your own model
 
@@ -56,8 +61,11 @@ python tournament/realpong.py                # resume realpong.pt
 python tournament/realpong.py --episodes 500 # stop after N
 ```
 
-Trains as the right player (symmetric env → plays both sides); curriculum goes
-`random` opponent → scripted `tracker` once it consistently wins.
+Trains as the right player (symmetric env → plays both sides). Two curricula run
+together:
+- **opponent:** `random` → scripted `tracker` only after a **98% win rate** vs random
+- **match length:** episodes `<1000` are 5-point matches, `1000–4999` are
+  10-point, `≥5000` are full **21-point official** matches
 
 ## Environment (`arena.PongSym`)
 

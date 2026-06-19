@@ -28,14 +28,26 @@ from arena import PongSym, Net, TrackerAgent, RandomAgent, UP, DOWN, D
 HERE = Path(__file__).resolve().parent
 SAVE = HERE / "realpong.pt"
 
-TRAIN_POINTS  = 5          # short games while training -> fast episodes
+# match-length curriculum: short games first (fast, dense signal), then longer,
+# ending on full 21-point official matches.
+#   episodes  <1000          -> 5-point matches
+#   1000..4999               -> 10-point matches
+#   >=5000                   -> 21-point official matches
+PHASE1_END, PHASE2_END = 1000, 5000
+POINTS_P1, POINTS_P2, POINTS_OFFICIAL = 5, 10, 21
+
+def match_points(ep):
+    if ep < PHASE1_END: return POINTS_P1
+    if ep < PHASE2_END: return POINTS_P2
+    return POINTS_OFFICIAL
+
 batch_size    = 16         # episodes accumulated per optimizer step
 learning_rate = 1e-3
 gamma         = 0.99
 value_coef    = 0.5
 entropy_coef  = 0.01
 grad_clip     = 1.0
-graduate_at   = 1.0        # avg reward (over the window) to move random -> tracker
+graduate_winrate = 0.98    # must win 98% vs the current opponent before graduating
 window        = 50
 
 
@@ -49,11 +61,12 @@ def discount(rewards):
     return out
 
 
-def play_episode(net, opponent, seed):
-    env = PongSym(seed=seed, points=TRAIN_POINTS)
+def play_episode(net, opponent, seed, points):
+    env = PongSym(seed=seed, points=points)
     obs = env.reset(seed=seed)
     prev = None
     logps, values, probs, rewards = [], [], [], []
+    hits = misses = 0          # ball arrivals at OUR paddle: returned vs missed
     done = False
     while not done:
         cur = obs["right"].ravel()
@@ -65,9 +78,10 @@ def play_episode(net, opponent, seed):
         action = UP if up.item() else DOWN
         logps.append(torch.log((prob if up else 1 - prob) + 1e-8))
         values.append(value); probs.append(prob)
-        obs, rew, done = env.step(action, opponent.act(obs["left"]))
+        obs, rew, done, info = env.step(action, opponent.act(obs["left"]))
         rewards.append(rew["right"])
-    return logps, values, probs, rewards, env.score_r, env.score_l
+        hits += info["hit_r"]; misses += info["miss_r"]
+    return logps, values, probs, rewards, env.score_r, env.score_l, hits, misses
 
 
 def main():
@@ -95,6 +109,9 @@ def main():
         print("fresh realpong (symmetric env)")
 
     recent = deque(maxlen=window)
+    recent_wins = deque(maxlen=window)
+    recent_hits = deque(maxlen=window)
+    recent_misses = deque(maxlen=window)
     opt.zero_grad()
     start = episode
     print(f"training on PongSym (symmetric). opponent: {mode}. Ctrl-C to stop.")
@@ -105,8 +122,10 @@ def main():
 
     try:
         while args.episodes == 0 or episode - start < args.episodes:
+            points = match_points(episode)
             opponent = RandomAgent(int(rng.integers(1 << 30))) if mode == "random" else TrackerAgent()
-            logps, values, probs, rewards, sr, sl = play_episode(net, opponent, int(rng.integers(1 << 30)))
+            logps, values, probs, rewards, sr, sl, hits, misses = play_episode(
+                net, opponent, int(rng.integers(1 << 30)), points)
 
             returns = torch.tensor(discount(np.array(rewards)), dtype=torch.float32)
             values_t = torch.stack(values)
@@ -125,11 +144,18 @@ def main():
 
             reward_sum = float(sum(rewards))
             recent.append(reward_sum)
+            recent_wins.append(1 if sr > sl else 0)
+            recent_hits.append(hits); recent_misses.append(misses)
             avg = float(np.mean(recent))
-            print(f"ep {episode:5d} | {sr}-{sl} | reward {reward_sum:+3.0f} | avg {avg:+5.2f} | opp {mode}")
+            winrate = float(np.mean(recent_wins))
+            arrivals = sum(recent_hits) + sum(recent_misses)
+            accuracy = (sum(recent_hits) / arrivals) if arrivals else 0.0   # return rate
+            print(f"ep {episode:5d} | {points:2d}pt | {sr}-{sl} | reward {reward_sum:+3.0f} "
+                  f"| win {winrate*100:4.0f}% | acc {accuracy*100:4.0f}% | opp {mode}")
 
-            if mode == "random" and len(recent) == window and avg >= graduate_at:
-                mode = "tracker"; recent.clear()
+            if mode == "random" and len(recent_wins) == window and winrate >= graduate_winrate:
+                mode = "tracker"; recent.clear(); recent_wins.clear()
+                recent_hits.clear(); recent_misses.clear()
                 print(">>> graduated: now training vs the ball-tracker")
 
             if episode % args.save_every == 0:
