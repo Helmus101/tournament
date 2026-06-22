@@ -104,6 +104,7 @@ gamma         = 0.99
 value_coef    = 0.5
 entropy_coef  = 0.005      # lower -> lets the policy sharpen instead of staying ~random
 grad_clip     = 1.0
+hit_bonus     = 0.02       # small dense reward for a return (teaches defense without out-valuing a +1 point)
 graduate_winrate = 0.80    # win 80% vs random before graduating to the ball-follower
 window        = 100        # win rate & accuracy are over the last 100 episodes
 
@@ -112,7 +113,7 @@ def discount(rewards):
     out = np.zeros_like(rewards, dtype=np.float64)
     run = 0.0
     for i in reversed(range(rewards.size)):
-        if rewards[i] != 0: run = 0.0
+        if abs(rewards[i]) >= 0.5: run = 0.0   # reset at POINT boundaries (+-1), not hit bonuses
         run = run * gamma + rewards[i]
         out[i] = run
     return out
@@ -121,6 +122,7 @@ def discount(rewards):
 def play_episode(net, opponent, seed, points):
     env = PongSym(seed=seed, points=points)
     obs = env.reset(seed=seed)
+    opponent.reset()
     prev = None
     logps, values, probs, rewards = [], [], [], []
     hits = misses = 0          # ball arrivals at OUR paddle: returned vs missed
@@ -136,7 +138,7 @@ def play_episode(net, opponent, seed, points):
         logps.append(torch.log((prob if up else 1 - prob) + 1e-8))
         values.append(value); probs.append(prob)
         obs, rew, done, info = env.step(action, opponent.act(obs["left"]))
-        rewards.append(rew["right"])
+        rewards.append(rew["right"] + (hit_bonus if info["hit_r"] else 0.0))   # shaped: + for a return
         hits += info["hit_r"]; misses += info["miss_r"]
     return logps, values, probs, rewards, env.score_r, env.score_l, hits, misses
 
@@ -146,7 +148,17 @@ def main():
     ap.add_argument("--episodes", type=int, default=0, help="stop after N (0 = until Ctrl-C)")
     ap.add_argument("--fresh", action="store_true", help="ignore saved weights")
     ap.add_argument("--save-every", type=int, default=50)
+    ap.add_argument("--reset-curriculum", action="store_true",
+                    help="keep weights but reset mode->random and episode->0 (unstick a stalled run)")
     args = ap.parse_args()
+
+    if args.reset_curriculum and SAVE.exists():
+        ck = torch.load(SAVE, map_location="cpu", weights_only=False)
+        if isinstance(ck, dict):
+            ck["mode"] = "random"
+            ck["episode"] = 0
+            torch.save(ck, SAVE)
+            print("reset curriculum to random (weights preserved) -> now training from random opponent")
 
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -176,6 +188,15 @@ def main():
     start = episode
     print(f"training on PongSym (symmetric). opponent: {mode}. Ctrl-C to stop.")
 
+    # self-play: a reusable opponent whose weights we swap to a past snapshot of self
+    opp_agent = Agent(stochastic=True, seed=12345)
+    pool = []                                   # frozen snapshots (state_dicts)
+    if mode == "selfplay":                      # resumed straight into self-play
+        pool.append({k: v.detach().clone() for k, v in net.state_dict().items()})
+
+    def snapshot():
+        return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
     def save():
         torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(),
                     "episode": episode, "mode": mode}, SAVE)
@@ -183,7 +204,13 @@ def main():
     try:
         while args.episodes == 0 or episode - start < args.episodes:
             points = match_points(episode)
-            opponent = RandomAgent(int(rng.integers(1 << 30))) if mode == "random" else TrackerAgent()
+            if mode == "random":
+                opponent = RandomAgent(int(rng.integers(1 << 30)))
+            elif mode == "tracker":
+                opponent = TrackerAgent(seed=int(rng.integers(1 << 30)))
+            else:                                # selfplay: opponent = a past snapshot of self
+                opp_agent.net.load_state_dict(pool[int(rng.integers(len(pool)))])
+                opponent = opp_agent
             logps, values, probs, rewards, sr, sl, hits, misses = play_episode(
                 net, opponent, int(rng.integers(1 << 30)), points)
 
@@ -202,7 +229,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
                 opt.step(); opt.zero_grad()
 
-            reward_sum = float(sum(rewards))
+            reward_sum = float(sr - sl)        # point margin (shaping bonuses excluded from display)
             recent.append(reward_sum)
             recent_wins.append(1 if sr > sl else 0)
             recent_hits.append(hits); recent_misses.append(misses)
@@ -213,10 +240,18 @@ def main():
             print(f"ep {episode:5d} | {points:2d}pt | {sr}-{sl} | reward {reward_sum:+3.0f} "
                   f"| win(100) {winrate*100:4.0f}% | acc(100) {accuracy*100:4.0f}% | opp {mode}")
 
-            if mode == "random" and len(recent_wins) == window and winrate >= graduate_winrate:
-                mode = "tracker"; recent.clear(); recent_wins.clear()
+            if len(recent_wins) == window and winrate >= graduate_winrate:
+                if mode == "random":
+                    mode = "tracker"
+                    print(">>> graduated: random -> ball-follower (80% win rate reached)")
+                elif mode == "tracker":
+                    mode = "selfplay"; pool.append(snapshot())
+                    print(">>> graduated: ball-follower -> SELF-PLAY (snapshot added)")
+                elif mode == "selfplay":
+                    pool.append(snapshot()); pool[:] = pool[-5:]   # keep last 5 selves
+                    print(f">>> self-play: added a stronger snapshot (pool size {len(pool)})")
+                recent.clear(); recent_wins.clear()
                 recent_hits.clear(); recent_misses.clear()
-                print(">>> graduated: now training vs the ball-tracker")
 
             if episode % args.save_every == 0:
                 save()

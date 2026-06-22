@@ -31,6 +31,7 @@ import importlib.util
 import itertools
 import os
 import sys
+from collections import deque
 
 import numpy as np
 
@@ -45,8 +46,11 @@ PADDLE_H     = 16          # paddle height in pixels
 PADDLE_SPEED = 3.0         # pixels per step
 PADDLE_X_L   = 3           # left paddle column
 PADDLE_X_R   = SIZE - 4    # right paddle column (76)
-BALL_SPEED   = 2.0         # horizontal pixels per step
-BALL_VY_MAX  = 2.0         # max vertical pixels per step
+BALL_SPEED   = 2.0         # horizontal pixels per step (at serve)
+BALL_VY_MAX  = 2.0         # max vertical pixels per step (at serve)
+BALL_SPEED_MAX  = 5.0      # hard cap after acceleration
+BALL_ACCEL      = 1.08     # speed multiplier per paddle hit (rally gets faster each return)
+PADDLE_KICK     = 0.4      # fraction of paddle velocity added to ball vy on contact
 POINTS       = 21          # a game is first to POINTS
 MAX_STEPS    = 8000        # truncate if neither side reaches POINTS
 
@@ -71,12 +75,14 @@ class PongSym:
 
     def _serve(self):
         self.pad_l = self.pad_r = (SIZE - PADDLE_H) / 2.0
+        self.prev_pad_l = self.prev_pad_r = (SIZE - PADDLE_H) / 2.0
         self.bx = SIZE / 2.0
         self.by = self.rng.uniform(SIZE * 0.3, SIZE * 0.7)
         self.bvy = float(self.rng.uniform(-BALL_VY_MAX, BALL_VY_MAX))
         self.bvx = float(BALL_SPEED * (1.0 if self.rng.random() < 0.5 else -1.0))
 
     def step(self, a_right, a_left):
+        self.prev_pad_l, self.prev_pad_r = self.pad_l, self.pad_r
         self._move("r", a_right)
         self._move("l", a_left)
         self.bx += self.bvx
@@ -88,12 +94,14 @@ class PongSym:
         hit_r = hit_l = miss_r = miss_l = False
         if self.bx <= PADDLE_X_L + 1:
             if self.pad_l <= self.by <= self.pad_l + PADDLE_H:
-                self.bx = PADDLE_X_L + 1; self._bounce(self.pad_l); hit_l = True
+                self.bx = PADDLE_X_L + 1
+                self._bounce(self.pad_l, self.pad_l - self.prev_pad_l); hit_l = True
             elif self.bx < 0:
                 reward_r = 1.0; miss_l = True
         elif self.bx >= PADDLE_X_R - 1:
             if self.pad_r <= self.by <= self.pad_r + PADDLE_H:
-                self.bx = PADDLE_X_R - 1; self._bounce(self.pad_r); hit_r = True
+                self.bx = PADDLE_X_R - 1
+                self._bounce(self.pad_r, self.pad_r - self.prev_pad_r); hit_r = True
             elif self.bx > SIZE - 1:
                 reward_r = -1.0; miss_r = True
 
@@ -110,10 +118,17 @@ class PongSym:
         if side == "r": self.pad_r = float(np.clip(self.pad_r + d, 0, SIZE - PADDLE_H))
         else:           self.pad_l = float(np.clip(self.pad_l + d, 0, SIZE - PADDLE_H))
 
-    def _bounce(self, paddle_top):
+    def _bounce(self, paddle_top, paddle_vel=0.0):
+        # speed up the ball each rally hit, capped at BALL_SPEED_MAX
+        speed = min(abs(self.bvx) * BALL_ACCEL, BALL_SPEED_MAX)
+        vy_range = speed  # vertical range scales with speed so angles stay meaningful
         offset = (self.by - paddle_top) / PADDLE_H - 0.5
-        self.bvx = -self.bvx
-        self.bvy = float(np.clip(offset * 2.0 * BALL_VY_MAX, -BALL_VY_MAX, BALL_VY_MAX))
+        self.bvx = float(np.sign(-self.bvx) * speed)
+        # paddle movement "kicks" the ball: a rising paddle adds topspin, a falling one backspin
+        self.bvy = float(np.clip(
+            offset * 2.0 * vy_range + paddle_vel * PADDLE_KICK,
+            -vy_range, vy_range,
+        ))
 
     def _render(self):
         f = np.zeros((SIZE, SIZE), np.float32)
@@ -137,17 +152,25 @@ D = SIZE * SIZE
 
 
 class TrackerAgent:
-    """Scripted reference ('bf'): move toward the ball. Strong but beatable."""
-    def reset(self): pass
+    """Scripted reference ('bf'): tracks the ball but with a REACTION DELAY, so it
+    moves toward where the ball WAS `lag` steps ago. A zero-lag tracker is
+    unbeatable in this env (paddle out-runs the ball), giving only 0-0 stalemates;
+    the delay makes it strong but beatable — sharp returns and wall-bounces get
+    past it, which is what lets a learner (and the tournament) actually score."""
+    def __init__(self, lag=8, seed=0):
+        self.lag = lag
+        self.hist = deque(maxlen=lag + 1)
+    def reset(self): self.hist.clear()
     def act(self, frame):
         ys, xs = np.nonzero(frame)
         if len(xs) == 0: return NOOP
         own, opp = xs.max(), xs.min()
         pad_c = ys[xs == own].mean()
         ball = (xs > opp + 1) & (xs < own - 1)
-        if not ball.any(): return NOOP
-        by = ys[ball].mean()
-        return UP if by < pad_c - 2 else DOWN if by > pad_c + 2 else NOOP
+        self.hist.append(ys[ball].mean() if ball.any() else None)
+        target = self.hist[0] if len(self.hist) == self.hist.maxlen else self.hist[-1]
+        if target is None: return NOOP
+        return UP if target < pad_c - 2 else DOWN if target > pad_c + 2 else NOOP
 
 
 class RandomAgent:
@@ -181,7 +204,7 @@ def load_submission(py_path, pt_path):
 
 
 def make_agent(spec, seed):
-    if spec == "bf":     return TrackerAgent()
+    if spec == "bf":     return TrackerAgent(seed=seed)
     if spec == "random": return RandomAgent(seed)
     if ":" in spec:                       # model.py:weights.pt  (code + weights)
         py, pt = spec.split(":", 1); return load_submission(py, pt)

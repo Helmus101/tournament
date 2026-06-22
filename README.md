@@ -78,9 +78,15 @@ python tournament/realpong.py --episodes 500 # stop after N
 
 Trains as the right player (symmetric env → plays both sides). Two curricula run
 together:
-- **opponent:** `random` → scripted ball-follower (`tracker`) after an **80% win rate** vs random
+- **opponent:** `random` → scripted ball-follower → **self-play** (vs frozen
+  snapshots of itself). Each stage advances at an **80% win rate** over the last
+  100 games. Self-play makes training mirror the real tournament (model vs model).
 - **match length:** episodes `<1000` are 5-point matches, `1000–4999` are
   10-point, `≥5000` are full **21-point official** matches
+
+The model input also mirrors what the arena feeds an `Agent` exactly: the
+**current 80×80 frame plus the frame difference** (absolute position + motion),
+and actions are sampled from the policy — identical to evaluation.
 
 ## Environment (`arena.PongSym`)
 
