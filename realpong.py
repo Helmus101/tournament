@@ -21,9 +21,9 @@ Opponent curriculum: a quick `random` warm-up, then an EASY ball-follower that
 gets harder one small notch at a time. The bf's difficulty is a `skill` scalar
 mapped to its reaction LAG: at skill 0.50 it chases a stale ball position (lag 24,
 sluggish/easy); each +0.02 sharpens it (less lag); at skill 1.00 it tracks the live
-ball (lag 0). skill rises by +0.02 each time the agent wins >=90% of the last 100
-games, and then STAYS at the top. The opponent is always the ball-follower — there
-is no self-play stage.
+ball (lag 0). skill rises each time the agent clears the win-rate gate; once it has
+beaten the tracker down to skill SELFPLAY_AT_SKILL (a competent defender), it
+graduates to SELF-PLAY vs a pool of frozen past selves.
 """
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from arena import (PongSym, TrackerAgent, RandomAgent, UP, DOWN, D,
 
 HERE = Path(__file__).resolve().parent
 SAVE = HERE / "realpong.pt"
+BEST = HERE / "realpong_best.pt"     # best-ever model by the fixed-tracker yardstick
 
 
 # ── THE MODEL (used by the tournament; trained by main() below) ───────────────
@@ -98,26 +99,28 @@ class Agent:
 
 def bf_lag(skill):
     """Map the difficulty scalar to the ball-follower's reaction LAG (the proven
-    difficulty knob: it tracks where the ball WAS `lag` steps ago). Easiest level
-    (skill=SKILL_START) -> LAG_EASY (sluggish, clearly beatable); hardest
-    (skill=SKILL_MAX) -> 0 (tracks the live ball). Higher skill = sharper = harder."""
-    frac = (SKILL_MAX - skill) / (SKILL_MAX - SKILL_START)   # 1.0 easiest .. 0.0 hardest
+    difficulty knob: it tracks where the ball WAS `lag` steps ago). skill=SKILL_MIN
+    -> LAG_EASY (sluggish); skill=SKILL_MAX -> 0 (tracks the live ball). Higher skill
+    = sharper = harder. (The curriculum STARTS at SKILL_START, not SKILL_MIN.)"""
+    frac = (SKILL_MAX - skill) / (SKILL_MAX - SKILL_MIN)     # 1.0 at SKILL_MIN .. 0.0 at SKILL_MAX
     return max(0, int(round(LAG_EASY * frac)))
 
 
-# match-length curriculum: short games first (fast, dense signal), then longer,
-# ending on full 21-point official matches.
-#   episodes  <1000          -> 5-point matches
-#   1000..4999               -> 10-point matches
-#   >=5000                   -> 21-point official matches
-PHASE1_END, PHASE2_END = 1000, 5000
-POINTS_P1, POINTS_P2, POINTS_OFFICIAL = 5, 10, 11   # train on 11-pt games (was 21): ~2x faster games,
-                                                    # same win-rate signal; the agent still plays 21 in the arena
+# match-length curriculum tied to SKILL (not episodes), so the ramp to full 21-point
+# games is GUARANTEED to happen before the self-play graduation:
+#   random warm-up            -> 5-point  matches (fast, dense signal)
+#   early tracker (skill<0.60)-> 10-point matches
+#   tracker skill>=0.60       -> 21-point matches  (reached BEFORE self-play at skill 0.70)
+#   self-play                 -> 21-point matches
+POINTS_WARMUP, POINTS_MID, POINTS_FULL = 5, 10, 21
+POINTS_21_AT_SKILL = 0.60     # full 21-pt games from this skill on (start is 0.70, so 21-pt throughout)
 
-def match_points(ep):
-    if ep < PHASE1_END: return POINTS_P1
-    if ep < PHASE2_END: return POINTS_P2
-    return POINTS_OFFICIAL
+def match_points(mode, skill):
+    if mode == "random":
+        return POINTS_WARMUP
+    if mode == "selfplay" or skill >= POINTS_21_AT_SKILL:
+        return POINTS_FULL
+    return POINTS_MID
 
 batch_size    = 32         # episodes per optimizer step (raised 16->32: lower-variance REINFORCE
                            # gradients -> steadier climb, clears the gate more reliably)
@@ -139,6 +142,8 @@ offense_coef  = 0.01       # OFFENSE shaping (on our return only): bonus for pla
                            # priority — fires per-return, so a large coef would out-weigh the
                            # dense per-step defense signal. Raise it later to push offense.
 window        = 50         # win rate & accuracy over the last 50 games (was 100 -> advances ~2x faster)
+eval_every    = 100        # every N episodes, eval vs the FIXED lag-8 tracker and keep the best-ever model
+eval_games    = 16
 
 # ── ball-follower difficulty ladder ──────────────────────────────────────────────
 # `skill` rises 0.50 -> 1.00 in +0.02 steps; bf_lag() maps it to the bf's reaction lag:
@@ -146,10 +151,14 @@ window        = 50         # win rate & accuracy over the last 50 games (was 100
 random_gate   = 0.80       # win 80% vs random before the ball-follower ladder begins
 level_gate    = 0.85       # advance bf difficulty above 85% win (was 0.90 -- above the MLP's
                            # ceiling at these lags, so it stalled; 0.85 keeps the ladder moving)
-SKILL_START   = 0.50       # easiest level
+SKILL_MIN     = 0.50       # bf-lag mapping floor: skill 0.50 -> lag LAG_EASY, skill 1.00 -> lag 0
+SKILL_START   = 0.70       # the ball-follower ladder STARTS here (~lag 14) -- per request
 SKILL_STEP    = 0.02       # each level sharpens the bf by one notch
-SKILL_MAX     = 1.00       # hardest level: lag 0 -> then stay here (no self-play)
-LAG_EASY      = 24         # bf reaction lag at the easiest level (very sluggish, >90% beatable)
+SKILL_MAX     = 1.00       # hardest tracker: lag 0 (tracks the live ball)
+LAG_EASY      = 24         # bf reaction lag at skill SKILL_MIN (very sluggish)
+SELFPLAY_AT_SKILL = 0.90   # graduate bf -> SELF-PLAY at this skill (~lag 5). NOT accuracy-gated
+                           # (accuracy caps ~50% here); skill is the reachable difficulty signal.
+POOL_SIZE     = 5          # keep the last N frozen selves as self-play opponents
 
 
 def discount(rewards):
@@ -249,6 +258,40 @@ def play_episode(net, opponent, seed, points):
     return logps, values, probs, rewards, env.score_r, env.score_l, hits, misses
 
 
+def atomic_save(obj, path):
+    """Crash-safe save: write to a temp file, verify it loads, then atomically replace."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    torch.save(obj, tmp)
+    torch.load(tmp, map_location="cpu", weights_only=False)   # verify before replacing
+    os.replace(tmp, path)
+
+
+@torch.no_grad()
+def evaluate_vs_bf(net, n=eval_games, lag=8, points=21):
+    """Greedy net vs the FIXED lag-8 tracker (the arena's `bf`), both sides. A stable
+    'how good is this model' yardstick for keep-best. Returns (win_rate, conceded/game)."""
+    rng = np.random.default_rng(777)
+    wins = conceded = 0
+    for g in range(n):
+        env = PongSym(seed=int(rng.integers(1 << 30)), points=points)
+        ob = env.reset(seed=int(rng.integers(1 << 30)))
+        opp = TrackerAgent(lag=lag, seed=int(rng.integers(1 << 30))); opp.reset()
+        prev = None
+        net_right = (g % 2 == 0)                              # play both sides
+        done = False
+        while not done:
+            frame = ob["right"] if net_right else ob["left"]
+            cur = frame.ravel().astype(np.float32)
+            x = features(cur, prev); prev = cur
+            prob, _ = net(torch.from_numpy(x).unsqueeze(0))
+            a = UP if float(prob.item()) > 0.5 else DOWN      # greedy
+            if net_right: ob, _, done, _ = env.step(a, opp.act(ob["left"]))
+            else:         ob, _, done, _ = env.step(opp.act(ob["right"]), a)
+        my, their = (env.score_r, env.score_l) if net_right else (env.score_l, env.score_r)
+        wins += int(my > their); conceded += their
+    return wins / n, conceded / n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=0, help="stop after N (0 = until Ctrl-C)")
@@ -275,6 +318,7 @@ def main():
     episode = 0
     mode = "random"
     skill = SKILL_START
+    best_score = float("-inf")  # best yardstick score so far (for keep-best)
     restore_window = None      # rolling win/hit window carried over from the checkpoint
     if SAVE.exists() and not args.fresh:
         ck = torch.load(SAVE, map_location="cpu", weights_only=False)
@@ -282,12 +326,13 @@ def main():
             net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
             if isinstance(ck, dict) and "optimizer" in ck: opt.load_state_dict(ck["optimizer"])
             episode = int(ck.get("episode", 0)) if isinstance(ck, dict) else 0
+            if isinstance(ck, dict): best_score = ck.get("best_score", float("-inf"))
             if isinstance(ck, dict) and "skill" in ck:
                 # already on the bf ladder -> restore it exactly
                 mode = ck.get("mode", "tracker")
                 skill = float(ck["skill"])
-                if mode not in ("random", "tracker"):   # legacy self-play state -> hardest bf
-                    mode, skill = "tracker", SKILL_MAX
+                if mode not in ("random", "tracker", "selfplay"):   # unknown -> safe default
+                    mode, skill = "tracker", SKILL_START
                 restore_window = ck                     # carry the 100-game window across restarts
                 print(f"resumed realpong.pt at episode {episode} (opponent: {mode}, bf skill {skill:.2f})")
             else:
@@ -317,17 +362,29 @@ def main():
     start = episode
     print(f"training on PongSym (symmetric). opponent: {mode}. Ctrl-C to stop.")
 
+    # self-play: a reusable opponent whose weights we swap to a frozen past snapshot of self
+    opp_agent = Agent(stochastic=True, seed=12345)
+    pool = []                                   # frozen snapshots (state_dicts)
+    if mode == "selfplay":                      # resumed straight into self-play -> seed the pool
+        pool.append({k: v.detach().clone() for k, v in net.state_dict().items()})
+
+    def snapshot():
+        return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
     def save():
-        torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(),
-                    "episode": episode, "mode": mode, "skill": skill,
-                    "recent": list(recent), "recent_wins": list(recent_wins),
-                    "recent_hits": list(recent_hits), "recent_misses": list(recent_misses)}, SAVE)
+        atomic_save({"model": net.state_dict(), "optimizer": opt.state_dict(),
+                     "episode": episode, "mode": mode, "skill": skill, "best_score": best_score,
+                     "recent": list(recent), "recent_wins": list(recent_wins),
+                     "recent_hits": list(recent_hits), "recent_misses": list(recent_misses)}, SAVE)
 
     try:
         while args.episodes == 0 or episode - start < args.episodes:
-            points = match_points(episode)
+            points = match_points(mode, skill)
             if mode == "random":
                 opponent = RandomAgent(int(rng.integers(1 << 30)))
+            elif mode == "selfplay":             # opponent = a frozen past snapshot of self
+                opp_agent.net.load_state_dict(pool[int(rng.integers(len(pool)))])
+                opponent = opp_agent
             else:                                # tracker: easy(laggy) -> hard(lag 0) ball-follower
                 opponent = TrackerAgent(lag=bf_lag(skill), seed=int(rng.integers(1 << 30)))
             logps, values, probs, rewards, sr, sl, hits, misses = play_episode(
@@ -366,16 +423,32 @@ def main():
                 if mode == "random":
                     mode, skill = "tracker", SKILL_START
                     print(f">>> warm-up cleared -> easy ball-follower ladder begins at skill {skill:.2f}")
-                elif skill < SKILL_MAX - 1e-9:
-                    skill = min(SKILL_MAX, round(skill + SKILL_STEP, 2))
-                    print(f">>> difficulty up: bf skill -> {skill:.2f} (>=90% win rate)")
-                else:
-                    print(">>> at hardest ball-follower (skill 1.00) -> staying here (no self-play)")
+                elif mode == "tracker":
+                    if skill >= SELFPLAY_AT_SKILL:           # mastered a sharp tracker -> spar self
+                        mode = "selfplay"; pool.append(snapshot())
+                        print(f">>> reached bf skill {skill:.2f} (lag {bf_lag(skill)}) -> SELF-PLAY (pool 1)")
+                    elif skill < SKILL_MAX - 1e-9:
+                        skill = min(SKILL_MAX, round(skill + SKILL_STEP, 2))
+                        print(f">>> difficulty up: bf skill -> {skill:.2f} (>=85% win rate)")
+                    else:
+                        mode = "selfplay"; pool.append(snapshot())   # ladder maxed
+                        print(">>> bf ladder maxed -> SELF-PLAY (pool 1)")
+                elif mode == "selfplay":                     # beating the pool -> add a stronger self
+                    pool.append(snapshot()); pool[:] = pool[-POOL_SIZE:]
+                    print(f">>> self-play: added a stronger snapshot (pool {len(pool)})")
                 recent.clear(); recent_wins.clear()
                 recent_hits.clear(); recent_misses.clear()
 
             if episode % args.save_every == 0:
                 save()
+
+            if episode % eval_every == 0:                    # keep the BEST-ever model (fixed yardstick)
+                wr, conc = evaluate_vs_bf(net)
+                score = wr - 0.01 * conc                     # win rate, tie-broken by fewer points conceded
+                if score > best_score:
+                    best_score = score
+                    atomic_save({"model": net.state_dict()}, BEST)
+                    print(f">>> NEW BEST vs bf-lag8: win {wr*100:.0f}% | conceded {conc:.1f} -> saved {BEST.name}")
     except KeyboardInterrupt:
         print("\nstopped")
     finally:

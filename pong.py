@@ -143,7 +143,7 @@ HIT_STRETCH = 0.01              # bonus for an off-centre return (a "further"/ha
 WINDOW          = 100
 RANDOM_GATE     = 0.80
 LEVEL_GATE      = 0.85          # advance the lag ladder above 85% win (keeps it moving as lag drops)
-LAG_START       = 24
+LAG_START       = 24           # start vs the easy tracker (lag 24)
 SELFPLAY_ACC    = 0.50
 SELFPLAY_AT_LAG = 12
 POOL_SIZE       = 5
@@ -158,11 +158,9 @@ EXTERNAL_FACTORY = None          # if set (by --opponent-file), builds the fixed
 
 
 def match_points(phase, lag, pool_size):
-    if phase == "random" or (phase == "tracker" and lag > 14):
-        return 5
-    if phase == "selfplay" and pool_size >= 3:
-        return 21
-    return 11
+    if phase == "random":
+        return 5            # quick cold-start warm-up only
+    return 21               # train on full 21-point games (matches the tournament)
 
 
 def agent_from_state(state):
@@ -335,6 +333,7 @@ def atomic_save(obj, path):
 def distill(net, spec, rng, n_frames=6000, epochs=3):
     """Warm-start: clone another agent's policy into our CNN (behavior cloning). Reads the teacher only."""
     code, wpath = spec.split(":")
+    if not os.path.exists(wpath): wpath = str(HERE / wpath)   # resolve relative to this file's dir
     mod = importlib.import_module(code[:-3] if code.endswith(".py") else code)
     try:
         teacher = mod.Agent(wpath, stochastic=False)
@@ -376,6 +375,8 @@ def main():
     ap.add_argument("--rollouts", type=int, default=0, help="stop after N rollouts (0 = until Ctrl-C)")
     ap.add_argument("--fresh", action="store_true", help="ignore saved checkpoint")
     ap.add_argument("--init-from", type=str, default=None, help="warm-start by distilling code.py:weights.pt")
+    ap.add_argument("--selfplay", action="store_true",
+                    help="force self-play now: spar a pool of frozen past selves (overrides phase)")
     ap.add_argument("--opponent-file", type=str, default=None,
                     help="train vs a fixed external agent code.py:weights.pt (e.g. newfolder.py:newfolder_trained_best.pt)")
     ap.add_argument("--save-every", type=int, default=2, help="save pong.pt every N rollouts")
@@ -421,6 +422,7 @@ def main():
     if args.opponent_file:
         global EXTERNAL_FACTORY
         code, wpath = args.opponent_file.split(":")
+        if not os.path.exists(wpath): wpath = str(HERE / wpath)   # resolve relative to this file's dir
         extmod = importlib.import_module(code[:-3] if code.endswith(".py") else code)
         extck = torch.load(wpath, map_location="cpu", weights_only=False)
         extstate = extck["model"] if isinstance(extck, dict) and "model" in extck else extck
@@ -432,6 +434,17 @@ def main():
         EXTERNAL_FACTORY = make_external
         phase = "external"                           # train every game vs this fixed opponent
         print(f"opponent: fixed external agent {args.opponent_file} (curriculum disabled)")
+
+    if phase == "external" and EXTERNAL_FACTORY is None:   # resumed an external-phase checkpoint w/o --opponent-file
+        phase = "tracker"                                 # crash fix: fall back to the tracker ladder
+        print("note: checkpoint was sparring an external opponent, but no --opponent-file given "
+              "-> resuming vs the tracker (re-pass --opponent-file to keep sparring that agent)")
+
+    if args.selfplay:                                     # force self-play now (overrides any phase)
+        phase = "selfplay"
+        print("forced self-play: sparring a pool of frozen past selves")
+    if phase == "selfplay" and not pool:                  # seed the pool with the current model
+        pool.append({k: v.detach().cpu().clone() for k, v in net.state_dict().items()})
 
     def save():
         atomic_save({"model": {k: v.detach().cpu() for k, v in net.state_dict().items()},
@@ -475,7 +488,8 @@ def main():
                     win_w.clear(); hit_w.clear(); miss_w.clear()
                     print(f">>> self-play: added a stronger snapshot (pool {len(pool)})")
 
-            print(f"r{rollout:4d} | {phase:8s} lag{lag:2d} | {points:2d}pt | win {winrate*100:4.0f}% "
+            opp_info = f"pool{len(pool)}" if phase == "selfplay" else f"lag{lag:2d}"
+            print(f"r{rollout:4d} | {phase:8s} {opp_info:6s} | {points:2d}pt | win {winrate*100:4.0f}% "
                   f"| acc {acc*100:4.0f}% | ent {ent:.3f} | anneal {anneal:.2f}")
 
             if rollout % args.save_every == 0:
@@ -492,7 +506,7 @@ def main():
                     no_improve += 1
                 print(f"   [eval] vs bf8 win {wr8*100:.0f}% conceded {conc8:.1f} | vs bf0 win {wr0*100:.0f}% "
                       f"| score {score:+.3f} (best {best_score:+.3f}){tag}")
-                hardest = (phase == "selfplay") or (phase == "tracker" and lag == 0)
+                hardest = (phase == "tracker" and lag == 0)   # self-play is open-ended -> no auto-stop
                 if hardest and no_improve >= EARLY_STOP_K:
                     print(f">>> early stop: no improvement for {EARLY_STOP_K} evals at the hardest level.")
                     break
