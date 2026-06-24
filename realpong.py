@@ -194,8 +194,8 @@ def _ideal_y(env):
     """Where the RIGHT paddle's CENTRE ideally is. When the ball is approaching,
     that's its predicted vertical intercept at the paddle column (wall bounces
     folded in) — rewarding this teaches anticipation, not just chasing. When the
-    ball is receding, the centre (ready position) — rewarding this teaches the
-    paddle to reset for the next rally instead of drifting."""
+    ball is receding, the paddle's CURRENT centre — i.e. no pull anywhere, so the
+    paddle just holds position instead of being magnetised back to the middle."""
     hi = SIZE - 1.0
     if env.bvx > 0 and env.bx < PADDLE_X_R:        # heading toward us
         steps = (PADDLE_X_R - env.bx) / env.bvx
@@ -203,7 +203,7 @@ def _ideal_y(env):
         period = 2 * hi
         y = y % period
         return y if y <= hi else period - y        # fold top/bottom reflections
-    return hi / 2.0                                # receding -> ready position (centre)
+    return env.pad_r + PADDLE_H / 2.0              # receding -> hold position (flat potential, no centre pull)
 
 
 def _potential(env):
