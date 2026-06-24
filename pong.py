@@ -45,6 +45,11 @@ HERE = Path(__file__).resolve().parent
 SAVE = HERE / "pong.pt"
 BEST = HERE / "pong_best.pt"
 
+# Environment used for rollouts AND the keep-best eval. Defaults to the standard PongSym;
+# main() swaps in arena_chaos.ChaosPong with --chaos, writing pong_chaos.pt / pong_chaos_best.pt
+# so a chaos run never touches pong.pt / pong_best.pt (the standard-arena best).
+ENV_CLASS = PongSym
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  THE MODEL  (used by the tournament; trained by main() below)
@@ -185,7 +190,7 @@ def collect_rollout(net, phase, lag, points, pool, anneal, rng):
     """Play N_ENVS games in lockstep on CPU; policy = RIGHT player, opponent = LEFT.
     Returns CPU tensors (main moves them to the update device) + finished-game stats."""
     steps = max(1, ROLLOUT_STEPS // N_ENVS)
-    envs = [PongSym(seed=int(rng.integers(1 << 30)), points=points) for _ in range(N_ENVS)]
+    envs = [ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points) for _ in range(N_ENVS)]
     obs = [e.reset(seed=int(rng.integers(1 << 30))) for e in envs]
     opps = [make_opponent(phase, lag, pool, rng) for _ in range(N_ENVS)]
     for o in opps:
@@ -224,7 +229,7 @@ def collect_rollout(net, phase, lag, points, pool, anneal, rng):
             obs[i] = ob
             if done:
                 games.append(1 if envs[i].score_r > envs[i].score_l else 0)
-                envs[i] = PongSym(seed=int(rng.integers(1 << 30)), points=points)
+                envs[i] = ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points)
                 obs[i] = envs[i].reset(seed=int(rng.integers(1 << 30)))
                 opps[i] = make_opponent(phase, lag, pool, rng); opps[i].reset()
                 prev_ds[i] = None
@@ -301,7 +306,7 @@ def eval_vs(net, opp_factory, n_games, points=21):
     rng = np.random.default_rng(12345)               # fixed seeds -> low-variance yardstick
     wins, conceded = 0, 0
     for g in range(n_games):
-        env = PongSym(seed=int(rng.integers(1 << 30)), points=points)
+        env = ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points)
         ob = env.reset(seed=int(rng.integers(1 << 30)))
         opp = opp_factory(rng); opp.reset(); me.reset()
         net_on_right = (g % 2 == 0)                  # play both sides
@@ -342,7 +347,7 @@ def distill(net, spec, rng, n_frames=6000, epochs=3):
     print(f"[distill] cloning {spec} into the CNN over ~{n_frames} frames ...")
     xs, ys = [], []
     while len(xs) < n_frames:
-        env = PongSym(seed=int(rng.integers(1 << 30)), points=21)
+        env = ENV_CLASS(seed=int(rng.integers(1 << 30)), points=21)
         ob = env.reset(seed=int(rng.integers(1 << 30)))
         teacher.reset(); opp = TrackerAgent(lag=8, seed=int(rng.integers(1 << 30))); opp.reset()
         prev_ds = None; done = False
@@ -381,7 +386,22 @@ def main():
                     help="train vs a fixed external agent code.py:weights.pt (e.g. newfolder.py:newfolder_trained_best.pt)")
     ap.add_argument("--save-every", type=int, default=2, help="save pong.pt every N rollouts")
     ap.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    ap.add_argument("--chaos", action="store_true",
+                    help="train on the HARDER arena_chaos.ChaosPong env (random, non-physical ball "
+                         "speed). Saves to pong_chaos.pt / pong_chaos_best.pt and warm-starts from "
+                         "pong.pt, so pong.pt / pong_best.pt (the standard-arena best) stay untouched")
     args = ap.parse_args()
+
+    # ── env + save-path selection (a chaos run writes its OWN files -> no collision) ──
+    global ENV_CLASS, SAVE, BEST
+    if args.chaos:
+        from arena_chaos import ChaosPong
+        ENV_CLASS = ChaosPong
+        if SAVE == HERE / "pong.pt":            # only redirect the DEFAULT paths (tests can override)
+            SAVE = HERE / "pong_chaos.pt"
+        if BEST == HERE / "pong_best.pt":
+            BEST = HERE / "pong_chaos_best.pt"
+        print(f"*** CHAOS env (random ball speed) -> {SAVE.name} / {BEST.name} ***")
 
     global DEVICE
     use_mps = (args.device in ("auto", "mps")) and torch.backends.mps.is_available()
@@ -416,7 +436,15 @@ def main():
         if args.init_from:
             distill(net, args.init_from, rng)
             opt = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)   # fresh optimizer after distill
-        print(f"fresh pong {'+ warm-start' if args.init_from else ''}")
+            print("fresh pong + warm-start")
+        elif args.chaos and (HERE / "pong.pt").exists():
+            # FIRST chaos run: warm-start weights from the already-trained standard model
+            # (read-only, same architecture) instead of starting cold; curriculum starts fresh.
+            ck = torch.load(HERE / "pong.pt", map_location=DEVICE, weights_only=False)
+            net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            print("CHAOS warm-start: copied weights from pong.pt (read-only); curriculum starts fresh")
+        else:
+            print("fresh pong")
 
     # ── fixed external sparring opponent (e.g. newfolder) — overrides the curriculum ──
     if args.opponent_file:
@@ -501,7 +529,7 @@ def main():
                 if score > best_score + 1e-4:
                     best_score = score; no_improve = 0
                     atomic_save({"model": {k: v.detach().cpu() for k, v in net.state_dict().items()}}, str(BEST))
-                    tag = " -> NEW BEST (saved pong_best.pt)"
+                    tag = f" -> NEW BEST (saved {BEST.name})"
                 else:
                     no_improve += 1
                 print(f"   [eval] vs bf8 win {wr8*100:.0f}% conceded {conc8:.1f} | vs bf0 win {wr0*100:.0f}% "
