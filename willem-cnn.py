@@ -49,6 +49,15 @@ BEST = HERE / "pong_best.pt"
 # main() swaps in arena_chaos.ChaosPong with --chaos, writing pong_chaos.pt / pong_chaos_best.pt
 # so a chaos run never touches pong.pt / pong_best.pt (the standard-arena best).
 ENV_CLASS = PongSym
+# With --both, MIX_ENVS is the list of env classes each rollout game is drawn from at random
+# (standard + chaos), so ONE "ambivalent" generalist learns to play either arena.
+MIX_ENVS = None
+
+
+def new_env(rng, points):
+    """Make a fresh env for a rollout game: a 50/50 draw from MIX_ENVS (generalist) or ENV_CLASS."""
+    cls = MIX_ENVS[int(rng.integers(len(MIX_ENVS)))] if MIX_ENVS else ENV_CLASS
+    return cls(seed=int(rng.integers(1 << 30)), points=points)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -190,7 +199,7 @@ def collect_rollout(net, phase, lag, points, pool, anneal, rng):
     """Play N_ENVS games in lockstep on CPU; policy = RIGHT player, opponent = LEFT.
     Returns CPU tensors (main moves them to the update device) + finished-game stats."""
     steps = max(1, ROLLOUT_STEPS // N_ENVS)
-    envs = [ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points) for _ in range(N_ENVS)]
+    envs = [new_env(rng, points) for _ in range(N_ENVS)]
     obs = [e.reset(seed=int(rng.integers(1 << 30))) for e in envs]
     opps = [make_opponent(phase, lag, pool, rng) for _ in range(N_ENVS)]
     for o in opps:
@@ -229,7 +238,7 @@ def collect_rollout(net, phase, lag, points, pool, anneal, rng):
             obs[i] = ob
             if done:
                 games.append(1 if envs[i].score_r > envs[i].score_l else 0)
-                envs[i] = ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points)
+                envs[i] = new_env(rng, points)
                 obs[i] = envs[i].reset(seed=int(rng.integers(1 << 30)))
                 opps[i] = make_opponent(phase, lag, pool, rng); opps[i].reset()
                 prev_ds[i] = None
@@ -299,14 +308,15 @@ def ppo_update(net, opt, data):
 
 
 @torch.no_grad()
-def eval_vs(net, opp_factory, n_games, points=21):
+def eval_vs(net, opp_factory, n_games, points=21, env_cls=None):
+    cls = env_cls or ENV_CLASS
     me = Agent()
     me.net.load_state_dict({k: v.detach().cpu() for k, v in net.state_dict().items()})
     me.net.eval()
     rng = np.random.default_rng(12345)               # fixed seeds -> low-variance yardstick
     wins, conceded = 0, 0
     for g in range(n_games):
-        env = ENV_CLASS(seed=int(rng.integers(1 << 30)), points=points)
+        env = cls(seed=int(rng.integers(1 << 30)), points=points)
         ob = env.reset(seed=int(rng.integers(1 << 30)))
         opp = opp_factory(rng); opp.reset(); me.reset()
         net_on_right = (g % 2 == 0)                  # play both sides
@@ -322,10 +332,19 @@ def eval_vs(net, opp_factory, n_games, points=21):
     return wins / n_games, conceded / n_games
 
 
-def yardstick(net):
-    wr8, conc8 = eval_vs(net, lambda r: TrackerAgent(lag=8, seed=int(r.integers(1 << 30))), EVAL_GAMES)
-    wr0, _ = eval_vs(net, lambda r: TrackerAgent(lag=0, seed=int(r.integers(1 << 30))), max(7, EVAL_GAMES // 3))
+def _yardstick_env(net, env_cls):
+    wr8, conc8 = eval_vs(net, lambda r: TrackerAgent(lag=8, seed=int(r.integers(1 << 30))), EVAL_GAMES, env_cls=env_cls)
+    wr0, _ = eval_vs(net, lambda r: TrackerAgent(lag=0, seed=int(r.integers(1 << 30))), max(7, EVAL_GAMES // 3), env_cls=env_cls)
     return wr8 - 0.01 * conc8 + 0.25 * wr0, wr8, conc8, wr0
+
+
+def yardstick(net):
+    # generalist: must score well on BOTH envs -> average the per-env yardsticks (keep-best on combined)
+    if MIX_ENVS:
+        a = _yardstick_env(net, MIX_ENVS[0])
+        b = _yardstick_env(net, MIX_ENVS[1])
+        return tuple((x + y) / 2 for x, y in zip(a, b))
+    return _yardstick_env(net, ENV_CLASS)
 
 
 def atomic_save(obj, path):
@@ -390,11 +409,23 @@ def main():
                     help="train on the HARDER arena_chaos.ChaosPong env (random, non-physical ball "
                          "speed). Saves to pong_chaos.pt / pong_chaos_best.pt and warm-starts from "
                          "pong.pt, so pong.pt / pong_best.pt (the standard-arena best) stay untouched")
+    ap.add_argument("--both", action="store_true",
+                    help="train ONE 'ambivalent' generalist on a 50/50 mix of the standard and chaos "
+                         "envs. Saves to pong_both.pt / pong_both_best.pt (best by combined std+chaos "
+                         "score), warm-starts from pong.pt; pong.pt / pong_best.pt stay untouched")
     args = ap.parse_args()
 
-    # ── env + save-path selection (a chaos run writes its OWN files -> no collision) ──
-    global ENV_CLASS, SAVE, BEST
-    if args.chaos:
+    # ── env + save-path selection (each mode writes its OWN files -> no collision) ──
+    global ENV_CLASS, MIX_ENVS, SAVE, BEST
+    if args.both:
+        from arena_chaos import ChaosPong
+        MIX_ENVS = [PongSym, ChaosPong]         # each rollout game drawn 50/50 from these
+        if SAVE == HERE / "pong.pt":            # only redirect the DEFAULT paths (tests can override)
+            SAVE = HERE / "pong_both.pt"
+        if BEST == HERE / "pong_best.pt":
+            BEST = HERE / "pong_both_best.pt"
+        print(f"*** GENERALIST: 50/50 standard+chaos -> {SAVE.name} / {BEST.name} ***")
+    elif args.chaos:
         from arena_chaos import ChaosPong
         ENV_CLASS = ChaosPong
         if SAVE == HERE / "pong.pt":            # only redirect the DEFAULT paths (tests can override)
@@ -437,6 +468,12 @@ def main():
             distill(net, args.init_from, rng)
             opt = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)   # fresh optimizer after distill
             print("fresh pong + warm-start")
+        elif args.both and (HERE / "pong.pt").exists():
+            # FIRST generalist run: warm-start from pong.pt -- the STRONGER standard model
+            # (it beats pong_best in both arenas) -- and adapt it to chaos via the 50/50 mix.
+            ck = torch.load(HERE / "pong.pt", map_location=DEVICE, weights_only=False)
+            net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            print("GENERALIST warm-start: copied weights from pong.pt (read-only); curriculum starts fresh")
         elif args.chaos and (HERE / "pong.pt").exists():
             # FIRST chaos run: warm-start weights from the already-trained standard model
             # (read-only, same architecture) instead of starting cold; curriculum starts fresh.

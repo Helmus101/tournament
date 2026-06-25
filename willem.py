@@ -45,6 +45,14 @@ HERE = Path(__file__).resolve().parent
 SAVE = HERE / "realpong.pt"
 BEST = HERE / "realpong_best.pt"     # best-ever model by the fixed-tracker yardstick
 
+# Environment for rollouts AND the keep-best eval. Defaults to standard PongSym; main()
+# swaps in arena_chaos.ChaosPong with --chaos, writing realpong_chaos.pt / realpong_chaos_best.pt
+# so a chaos run never touches realpong.pt / realpong_best.pt.
+ENV_CLASS = PongSym
+# With --both, MIX_ENVS is the list of env classes each training episode is drawn from at
+# random (standard + chaos), so ONE generalist learns to play either arena.
+MIX_ENVS = None
+
 
 # ── THE MODEL (used by the tournament; trained by main() below) ───────────────
 class Net(nn.Module):
@@ -237,11 +245,12 @@ def _offense(env):
     return min(1.0, abs(target - opp_c) / SIZE)
 
 
-def play_episode(net, opponent, seed, points):
-    """Roll out one game with NO grad (fast, no autograd graph). Stores per-step inputs and
+def play_episode(net, opponent, seed, points, env_cls=None):
+    """Roll out one game with NO grad (fast, no autograd graph). env_cls picks the environment
+    for this episode (defaults to ENV_CLASS). Stores per-step inputs and
     sampled actions; the gradient comes from ONE batched forward+backward in main() (much
     faster than building/backpropping a per-step graph -- the old bottleneck)."""
-    env = PongSym(seed=seed, points=points)
+    env = (env_cls or ENV_CLASS)(seed=seed, points=points)
     obs = env.reset(seed=seed)
     opponent.reset()
     prev = None
@@ -283,13 +292,14 @@ def atomic_save(obj, path):
 
 
 @torch.no_grad()
-def evaluate_vs_bf(net, n=eval_games, lag=8, points=21):
+def evaluate_vs_bf(net, n=eval_games, lag=8, points=21, env_cls=None):
     """Greedy net vs the FIXED lag-8 tracker (the arena's `bf`), both sides. A stable
     'how good is this model' yardstick for keep-best. Returns (win_rate, conceded/game)."""
     rng = np.random.default_rng(777)
+    cls = env_cls or ENV_CLASS
     wins = conceded = 0
     for g in range(n):
-        env = PongSym(seed=int(rng.integers(1 << 30)), points=points)
+        env = cls(seed=int(rng.integers(1 << 30)), points=points)
         ob = env.reset(seed=int(rng.integers(1 << 30)))
         opp = TrackerAgent(lag=lag, seed=int(rng.integers(1 << 30))); opp.reset()
         prev = None
@@ -342,7 +352,34 @@ def main():
     ap.add_argument("--start-lag", type=int, default=None,
                     help="for --opponent-file: start the opponent's lag ladder at THIS lag "
                          "(e.g. 5) instead of the easy end; it still climbs toward lag 0")
+    ap.add_argument("--chaos", action="store_true",
+                    help="train on the HARDER arena_chaos.ChaosPong env (random ball speed). Saves to "
+                         "realpong_chaos.pt / realpong_chaos_best.pt and warm-starts from realpong.pt, "
+                         "so realpong.pt / realpong_best.pt stay untouched")
+    ap.add_argument("--both", action="store_true",
+                    help="train ONE generalist on a 50/50 mix of standard+chaos. Warm-starts from the "
+                         "AVERAGE of realpong_best.pt and realpong_chaos_best.pt; saves to realpong_both.pt "
+                         "/ realpong_both_best.pt (best by combined score). The source bests stay untouched")
     args = ap.parse_args()
+
+    # ── env + save-path selection (each mode writes its OWN files -> no collision) ──
+    global ENV_CLASS, MIX_ENVS, SAVE, BEST
+    if args.both:
+        from arena_chaos import ChaosPong
+        MIX_ENVS = [PongSym, ChaosPong]         # each episode drawn 50/50 from these
+        if SAVE == HERE / "realpong.pt":        # only redirect the DEFAULT paths (tests can override)
+            SAVE = HERE / "realpong_both.pt"
+        if BEST == HERE / "realpong_best.pt":
+            BEST = HERE / "realpong_both_best.pt"
+        print(f"*** GENERALIST: 50/50 standard+chaos -> {SAVE.name} / {BEST.name} ***")
+    elif args.chaos:
+        from arena_chaos import ChaosPong
+        ENV_CLASS = ChaosPong
+        if SAVE == HERE / "realpong.pt":        # only redirect the DEFAULT paths (tests can override)
+            SAVE = HERE / "realpong_chaos.pt"
+        if BEST == HERE / "realpong_best.pt":
+            BEST = HERE / "realpong_chaos_best.pt"
+        print(f"*** CHAOS env (random ball speed) -> {SAVE.name} / {BEST.name} ***")
 
     # ── optional: external fixed opponent (e.g. pong_best) ─────────────────────
     external_opp = None
@@ -398,6 +435,29 @@ def main():
                       f"starting easy ball-follower ladder at skill {skill:.2f}")
         except (RuntimeError, ValueError):
             print("existing realpong.pt is from the OLD model architecture -> starting fresh")
+    elif args.both and (HERE / "realpong_best.pt").exists() and (HERE / "realpong_chaos_best.pt").exists():
+        # FIRST generalist run: warm-start from the AVERAGE of the two specialist bests (a
+        # "model soup" of the standard-best and chaos-best), then adapt on the 50/50 mix.
+        def _state(p):
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            return ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+        sa = _state(HERE / "realpong_best.pt"); sb = _state(HERE / "realpong_chaos_best.pt")
+        try:
+            avg = {k: (sa[k] + sb[k]) / 2.0 for k in sa}
+            net.load_state_dict(avg)
+            print("GENERALIST warm-start: averaged realpong_best.pt + realpong_chaos_best.pt "
+                  "(read-only); curriculum starts fresh")
+        except (RuntimeError, ValueError, KeyError):
+            print("could not average the two bests (mismatch) -> fresh")
+    elif args.chaos and (HERE / "realpong.pt").exists():
+        # FIRST chaos run: warm-start weights from the trained standard model (read-only);
+        # curriculum/best start fresh because the env (and so the yardstick) is different.
+        ck = torch.load(HERE / "realpong.pt", map_location="cpu", weights_only=False)
+        try:
+            net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            print("CHAOS warm-start: copied weights from realpong.pt (read-only); curriculum starts fresh")
+        except (RuntimeError, ValueError):
+            print("could not warm-start from realpong.pt (mismatch) -> fresh")
     else:
         print("fresh realpong (symmetric env)")
 
@@ -444,7 +504,7 @@ def main():
     elif mode == "tracker" and skill >= SELFPLAY_AT_SKILL - 1e-9:
         mode = "selfplay"
         print(f">>> resumed at skill {skill:.2f} (>= {SELFPLAY_AT_SKILL}) -> SELF-PLAY now")
-    print(f"training on PongSym (symmetric). opponent: {mode}. Ctrl-C to stop.")
+    print(f"training on {ENV_CLASS.__name__} (symmetric). opponent: {mode}. Ctrl-C to stop.")
 
     # self-play: a reusable opponent whose weights we swap to a frozen past snapshot of self
     opp_agent = Agent(stochastic=True, seed=12345)
@@ -475,9 +535,11 @@ def main():
                     opponent = opp_agent
                 else:                            # tracker: easy(laggy) -> hard(lag 0) ball-follower
                     opponent = TrackerAgent(lag=bf_lag(skill), seed=int(rng.integers(1 << 30)))
+            # generalist: draw this episode's env 50/50 from the mix (standard | chaos)
+            ep_env = MIX_ENVS[int(rng.integers(len(MIX_ENVS)))] if MIX_ENVS else None
             t0 = time.perf_counter()
             xs, ups, rewards, sr, sl, hits, misses = play_episode(
-                net, opponent, int(rng.integers(1 << 30)), points)
+                net, opponent, int(rng.integers(1 << 30)), points, env_cls=ep_env)
             t_play = time.perf_counter() - t0
 
             t0 = time.perf_counter()
@@ -512,8 +574,9 @@ def main():
             accuracy = (sum(recent_hits) / arrivals) if arrivals else 0.0   # return rate
             if mode == "external": label = f"external(skill={skill:.2f},lag={bf_lag(skill)})"
             else: label = f"bf(skill={skill:.2f},lag={bf_lag(skill)})" if mode == "tracker" else mode
+            env_tag = f" | env {ep_env.__name__}" if MIX_ENVS else ""
             print(f"ep {episode:5d} | {points:2d}pt | {sr}-{sl} | reward {reward_sum:+3.0f} "
-                  f"| win {len(recent_wins):3d}/{window} {winrate*100:5.1f}% | acc {accuracy*100:4.0f}% | opp {label} "
+                  f"| win {len(recent_wins):3d}/{window} {winrate*100:5.1f}% | acc {accuracy*100:4.0f}% | opp {label}{env_tag} "
                   f"| {len(rewards):5d}st play {t_play:5.2f}s upd {t_upd*1000:4.0f}ms")
 
             gate = random_gate if mode == "random" else level_gate
@@ -556,14 +619,21 @@ def main():
 
             if episode % eval_every == 0:                    # keep the BEST-ever model (fixed yardstick)
                 t0 = time.perf_counter()
-                wr, conc = evaluate_vs_bf(net)
-                score = wr - 0.01 * conc                     # win rate, tie-broken by fewer points conceded
+                if MIX_ENVS:                                 # generalist: must be good at BOTH envs
+                    ws, cs = evaluate_vs_bf(net, env_cls=MIX_ENVS[0])
+                    wc, cc = evaluate_vs_bf(net, env_cls=MIX_ENVS[1])
+                    score = ((ws - 0.01 * cs) + (wc - 0.01 * cc)) / 2     # combined std+chaos
+                    detail = f"std win {ws*100:.0f}% | chaos win {wc*100:.0f}%"
+                else:
+                    wr, conc = evaluate_vs_bf(net)
+                    score = wr - 0.01 * conc                 # win rate, tie-broken by fewer points conceded
+                    detail = f"win {wr*100:.0f}% | conceded {conc:.1f}"
                 tag = ""
                 if score > best_score:
                     best_score = score
                     atomic_save({"model": net.state_dict()}, BEST)
                     tag = f" -> NEW BEST (saved {BEST.name})"
-                print(f"   [eval {time.perf_counter()-t0:.1f}s] vs bf-lag8: win {wr*100:.0f}% | conceded {conc:.1f}{tag}")
+                print(f"   [eval {time.perf_counter()-t0:.1f}s] vs bf-lag8: {detail}{tag}")
     except KeyboardInterrupt:
         print("\nstopped")
     finally:

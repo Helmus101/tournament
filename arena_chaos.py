@@ -22,9 +22,9 @@ Any existing submission plugs in UNCHANGED (the observation is the identical
 80x80 canonical frame). With no entrants named it defaults to the chaos-trained
 pong vs the references; or name them like the normal arena:
 
-    python arena_chaos.py                                   # pong_chaos_best vs bf, random
-    python arena_chaos.py pong.py:pong_chaos_best.pt bf random
-    python arena_chaos.py pong.py:pong_chaos_best.pt realpong.py:realpong.pt --headless
+    python arena_chaos.py                                   # willem-cnn vs bf, random
+    python arena_chaos.py willem-cnn.py:willem-cnn.pt bf random
+    python arena_chaos.py willem-cnn.py:willem-cnn.pt willem.py:willem.pt --headless
     python arena_chaos.py --best-of 5
 
 Implementation note: this reuses arena.py's entire tournament/visualizer/agent
@@ -112,10 +112,15 @@ def _has_positional_models():
 
 
 def main():
-    # default entrants for the chaos arena: the chaos-trained pong vs the references
+    # default entrants for the chaos arena: the CNN champion (willem-cnn) vs the references
     if not _has_positional_models():
-        pong_w = "pong_chaos_best.pt" if (HERE / "pong_chaos_best.pt").exists() else "pong_best.pt"
-        sys.argv += [f"pong.py:{pong_w}", "bf", "random"]
+        if (HERE / "willem-cnn.pt").exists():
+            default = "willem-cnn.py:willem-cnn.pt"
+        elif (HERE / "pong_chaos_best.pt").exists():
+            default = "pong.py:pong_chaos_best.pt"
+        else:
+            default = "pong.py:pong_best.pt"
+        sys.argv += [default, "bf", "random"]
 
     print("=" * 56)
     print("  CHAOS ARENA  --  ball speed is random & non-physical")
