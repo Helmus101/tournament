@@ -1,9 +1,12 @@
-"""newfolder.py -- arena submission: the model (CNN) + the Agent contract.
-Shared by train_newfolder.py (training) and arena.py (the tournament) so they use IDENTICAL code.
+"""lamine.py -- Lamine's tournament entry (REGULAR arena). Pairs with lamine.pt.
 
-Input = 2 channels of 80x80: [current frame (position), current-previous (motion)].
-A CNN (not an MLP) so it can LOCALIZE the ball/paddle anywhere via shared spatial filters --
-the MLP plateaued because it can't find a 1-pixel ball from raw pixels. Acts every frame.
+A CNN agent. Input = 2 channels of 80x80: [current frame (position), current - previous (motion)].
+3 conv layers (32/64/64) -> fc 256 -> policy head (P(UP)) + value head, ~1.7M params, full 80x80
+resolution. Trained by first cloning a strong opponent to reach its level, then PPO self-play
+against a pool of past selves with a pure win/loss reward to push past it.
+
+Self-contained: only needs numpy + torch. The arena imports this module and calls
+Agent(weights_path); act() returns 2 (UP) or 3 (DOWN), own paddle on the RIGHT.
 """
 import os
 import numpy as np
@@ -18,10 +21,11 @@ class Net(nn.Module):
     def __init__(self, hidden=256):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(2, 16, 8, stride=4, padding=2), nn.ReLU(),   # (2,80,80) -> (16,20,20)
-            nn.Conv2d(16, 32, 4, stride=2, padding=1), nn.ReLU(),  # -> (32,10,10) = 3200
+            nn.Conv2d(2, 32, 8, stride=4, padding=2), nn.ReLU(),   # (2,80,80) -> (32,20,20)
+            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.ReLU(),  # -> (64,10,10)
+            nn.Conv2d(64, 64, 3, stride=1, padding=1), nn.ReLU(),  # -> (64,10,10) = 6400
         )
-        self.fc = nn.Linear(32 * 10 * 10, hidden)
+        self.fc = nn.Linear(64 * 10 * 10, hidden)
         self.policy_head = nn.Linear(hidden, 1)
         self.value_head = nn.Linear(hidden, 1)
 
@@ -32,7 +36,6 @@ class Net(nn.Module):
 
 
 def features(cur, prev):
-    """cur, prev: flat 6400 frames. Returns a (2, 80, 80) image: [position, motion]."""
     diff = cur - prev if prev is not None else np.zeros(D, np.float32)
     return np.stack([cur.reshape(80, 80), diff.reshape(80, 80)]).astype(np.float32)
 
@@ -46,7 +49,7 @@ class Agent:
             try:
                 self.net.load_state_dict(state)
             except Exception as e:
-                print(f"[newfolder] weights don't fit this CNN ({e}) -- using random init")
+                print(f"[lamine] weights don't fit this CNN ({e}) -- using random init")
         self.net.eval()
         self.prev = None
 
@@ -55,7 +58,7 @@ class Agent:
 
     @torch.no_grad()
     def act(self, frame):
-        cur = frame.astype(np.float32).ravel()      # arena gives 80x80 binary, own paddle RIGHT
+        cur = frame.astype(np.float32).ravel()
         x = features(cur, self.prev)
         self.prev = cur
         prob, _ = self.net(torch.from_numpy(x).unsqueeze(0))
