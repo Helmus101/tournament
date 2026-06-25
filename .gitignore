@@ -8,3 +8,7 @@ build/
 
 # macOS / iCloud sync-conflict copies ("name 2.ext")
 * [0-9].*
+
+# weights: keep all locally, but only the chosen models are tracked (force-added)
+*.pt
+*.testbak
