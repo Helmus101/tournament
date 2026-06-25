@@ -1,130 +1,96 @@
-"""lucas_pong.py  --  Soumission de Lucas : politique CNN entrainee en PPO.
-Fonctionne sur les DEUX arenes : arena.py (standard) ET arena_chaos.py.
+"""bigpong.py -- agent de Lucas, version "CNN pousse" : un reseau convolutif PLUS GROS
+entraine en PPO (par train_bigpong.py), pour jouer fort sur LES DEUX arenes
+(arena.py standard ET arena_chaos.py). UN seul .pt pour les deux tournois.
 
-Contract (charge par arena.py comme `lucas_pong.py:lucas.pt`):
-    class Agent: __init__(weights_path), reset(), act(frame)->2/3/0
+Le tournoi importe juste la classe Agent :
+    python arena.py        bigpong.py:bigpong.pt  bf
+    python arena_chaos.py  bigpong.py:bigpong.pt  bf
 
-  python arena.py        realpong.py:realpong.pt  lucas_pong.py:lucas.pt
-  python arena_chaos.py  realpong.py:realpong.pt  lucas_pong.py:lucas.pt
+Pixels only. L'agent voit la vraie frame 80x80, la reduit a 40x40 (max-pool 2x2,
+l'env n'est PAS modifie -- l'agent "plisse les yeux"), et donne au CNN une image
+2 canaux [position, mouvement] (mouvement = frame courante - frame precedente, en
+40x40 -> lit la VITESSE de la balle directement dans les pixels). Deux actions
+seulement (UP/DOWN), joue a chaque frame, argmax a l'evaluation.
 
-Le reseau ET le pretraitement exact vivent ici -> entrainement et jeu identiques.
-
-Input to the net = 2 channels x 80 x 80:
-    channel 0 = current frame (1.0 = paddle/ball pixel)
-    channel 1 = current - previous frame  (motion; localizes the 1-px ball)
-Policy outputs 2 logits; index -> env action: 0=UP(2), 1=DOWN(3). Always moving (no STAY).
+Reseau (notre version "poussee", ~2,5 M params, plus gros que pong.py) :
+    conv 2->32 (4x4,s2) -> conv 32->64 (4x4,s2) -> conv 64->64 (3x3,s1)
+    -> FC 6400->384 -> tete politique (2 logits) + tete valeur (1).
+Ce fichier est AUTONOME (numpy + torch) : aucune dependance a arena/entrainement.
 """
+from __future__ import annotations
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 
 UP, DOWN = 2, 3
-ACTIONS = [UP, DOWN]                # policy index -> env action (always moving; no STAY)
-N_ACT = 2
+ACTIONS = [UP, DOWN]          # index politique 0 -> UP, 1 -> DOWN
 SIZE = 80
-# DEVICE is used by TRAINING (train_ppo.py) for big batched updates -> keep CUDA.
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# PLAY device: act() runs ONE 2x80x80 sample per frame. At that size CPU beats GPU
-# (no per-frame host<->device copy / kernel-launch overhead), so play on CPU.
-PLAY_DEVICE = torch.device("cpu")
+DS = 40                       # cote apres max-pool 2x2 de la frame 80x80
+HIDDEN = 384
 
 
-class PolicyCNN(nn.Module):
-    """2x80x80 -> conv stack -> (policy logits[3], value[1])."""
-    def __init__(self, n_actions=N_ACT):
+def downsample(frame):
+    """80x80 -> 40x40 par max-pool 2x2. Frames binaires -> le max garde la balle
+    d'1 pixel et les colonnes de raquette. Pretraitement cote agent uniquement."""
+    f = np.asarray(frame, dtype=np.float32).reshape(SIZE, SIZE)
+    return f.reshape(DS, 2, DS, 2).max(axis=(1, 3))
+
+
+def features(cur_ds, prev_ds):
+    """Image (2,40,40) : [position, mouvement]. Mouvement = diff des 2 dernieres
+    frames downsamplees ; zero a la toute premiere frame d'une partie."""
+    motion = (cur_ds - prev_ds) if prev_ds is not None else np.zeros_like(cur_ds)
+    return np.stack([cur_ds, motion]).astype(np.float32)
+
+
+class Net(nn.Module):
+    """CNN pousse : 3 convs -> tronc partage -> politique (2 logits) + valeur."""
+    def __init__(self, hidden=HIDDEN):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=8, stride=4),    # 80 -> 19
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),   # 19 -> 8
-            nn.ReLU(inplace=True),
+            nn.Conv2d(2, 32, 4, stride=2, padding=1), nn.ReLU(),   # (2,40,40) -> (32,20,20)
+            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.ReLU(),  # -> (64,10,10)
+            nn.Conv2d(64, 64, 3, stride=1, padding=1), nn.ReLU(),  # -> (64,10,10) = 6400
         )
-        self.fc = nn.Sequential(nn.Linear(32 * 8 * 8, 256), nn.ReLU(inplace=True))
-        self.pi = nn.Linear(256, n_actions)
-        self.v = nn.Linear(256, 1)
+        self.fc = nn.Linear(64 * 10 * 10, hidden)
+        self.policy_head = nn.Linear(hidden, 2)    # logits [UP, DOWN]
+        self.value_head = nn.Linear(hidden, 1)
+        self._init_weights()
 
-    def forward(self, x):
-        h = self.conv(x)
-        h = h.reshape(h.size(0), -1)
-        h = self.fc(h)
-        return self.pi(h), self.v(h).squeeze(-1)
+    def _init_weights(self):
+        for m in self.conv:
+            if isinstance(m, nn.Conv2d):
+                nn.init.orthogonal_(m.weight, np.sqrt(2.0)); nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc.weight, np.sqrt(2.0)); nn.init.zeros_(self.fc.bias)
+        nn.init.orthogonal_(self.policy_head.weight, 0.01); nn.init.zeros_(self.policy_head.bias)
+        nn.init.orthogonal_(self.value_head.weight, 1.0);  nn.init.zeros_(self.value_head.bias)
 
-
-class FrameProcessor:
-    """Turns a raw 80x80 frame into the 2-channel [current, current-prev] input.
-    Holds the previous frame; MUST be reset at the start of each game."""
-    def __init__(self):
-        self.prev = None
-
-    def reset(self):
-        self.prev = None
-
-    def __call__(self, frame):
-        cur = np.asarray(frame, dtype=np.float32)
-        diff = cur - self.prev if self.prev is not None else np.zeros_like(cur)
-        self.prev = cur
-        return np.stack([cur, diff], axis=0)          # (2, 80, 80)
+    def forward(self, x):                          # x: (B, 2, 40, 40)
+        h = self.conv(x).flatten(1)
+        h = torch.relu(self.fc(h))
+        return self.policy_head(h), self.value_head(h).squeeze(-1)
 
 
 class Agent:
-    """Play-time agent. Optimized for low per-frame latency (act() is called once
-    per env step), WITHOUT changing any decision -- the argmax is byte-for-byte
-    identical to the naive forward. Optimizations:
-      * run on CPU with a single thread  (single-sample inference: thread-dispatch
-        and GPU transfer overhead dominate the tiny conv -> both hurt; ~1.7x faster)
-      * torch.inference_mode + pre-allocated numpy/torch buffers (zero alloc/frame)
-      * skip the value head (unused in play) and reduce argmax(2) to a scalar compare
-      * optional frozen TorchScript graph (a further ~7%), with eager fallback.
-    """
+    """Contrat tournoi : reset() au debut de chaque partie, act(frame 80x80, raquette
+    a DROITE) -> 2 (UP) ou 3 (DOWN)."""
     def __init__(self, weights_path=None):
-        torch.set_num_threads(1)                       # biggest single win on this tiny net
-        self.net = PolicyCNN().to(PLAY_DEVICE)
-        if weights_path:
-            ck = torch.load(weights_path, map_location=PLAY_DEVICE, weights_only=False)
-            sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
-            self.net.load_state_dict(sd)
+        self.net = Net()
+        if weights_path and os.path.exists(weights_path):
+            ck = torch.load(weights_path, map_location="cpu", weights_only=False)
+            state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+            self.net.load_state_dict(state)
         self.net.eval()
-
-        # zero-allocation buffers: [current, current-prev] reused every frame
-        self._buf = np.zeros((2, SIZE, SIZE), dtype=np.float32)
-        self._x = torch.zeros((1, 2, SIZE, SIZE), dtype=torch.float32, device=PLAY_DEVICE)
-        self.prev = None
-
-        # policy-only module (no value head) + try to freeze it with TorchScript
-        self._infer = self._make_infer(self.net)
-
-    @staticmethod
-    def _make_infer(net):
-        class _PiOnly(nn.Module):
-            def __init__(self, net):
-                super().__init__()
-                self.conv, self.fc, self.pi = net.conv, net.fc, net.pi
-            def forward(self, x):
-                h = self.conv(x)
-                h = self.fc(h.reshape(1, -1))
-                return self.pi(h)[0]                    # (2,) logits
-        m = _PiOnly(net).eval()
-        try:
-            with torch.inference_mode():
-                m = torch.jit.freeze(torch.jit.trace(m, torch.zeros(1, 2, SIZE, SIZE)))
-                for _ in range(8):                      # warm up the JIT graph
-                    m(torch.zeros(1, 2, SIZE, SIZE))
-        except Exception:
-            pass                                        # eager fallback (still fast)
-        return m
+        self.prev_ds = None
 
     def reset(self):
-        self.prev = None
+        self.prev_ds = None
 
-    @torch.inference_mode()
-    def act(self, frame) -> int:
-        cur = np.asarray(frame, dtype=np.float32)
-        self._buf[0] = cur
-        if self.prev is not None:
-            np.subtract(cur, self.prev, out=self._buf[1])
-        else:
-            self._buf[1].fill(0.0)
-        self.prev = cur
-        self._x.copy_(torch.from_numpy(self._buf))
-        logits = self._infer(self._x)
-        return ACTIONS[1 if logits[1].item() > logits[0].item() else 0]
+    @torch.no_grad()
+    def act(self, frame):
+        cur_ds = downsample(frame)
+        x = features(cur_ds, self.prev_ds)
+        self.prev_ds = cur_ds
+        logits, _ = self.net(torch.from_numpy(x).unsqueeze(0))
+        return ACTIONS[int(torch.argmax(logits, dim=-1).item())]

@@ -49,14 +49,18 @@ BEST = HERE / "pong_best.pt"
 # main() swaps in arena_chaos.ChaosPong with --chaos, writing pong_chaos.pt / pong_chaos_best.pt
 # so a chaos run never touches pong.pt / pong_best.pt (the standard-arena best).
 ENV_CLASS = PongSym
-# With --both, MIX_ENVS is the list of env classes each rollout game is drawn from at random
-# (standard + chaos), so ONE "ambivalent" generalist learns to play either arena.
+# With --both, MIX_ENVS = [standard, chaos] and each rollout game is drawn from them with
+# P(chaos) = MIX_CHAOS_FRAC, so ONE generalist learns both arenas but PRIORITISES chaos.
 MIX_ENVS = None
+MIX_CHAOS_FRAC = 0.6        # share of rollout games on the chaos env when --both (set by --chaos-frac)
 
 
 def new_env(rng, points):
-    """Make a fresh env for a rollout game: a 50/50 draw from MIX_ENVS (generalist) or ENV_CLASS."""
-    cls = MIX_ENVS[int(rng.integers(len(MIX_ENVS)))] if MIX_ENVS else ENV_CLASS
+    """Make a fresh env for a rollout game: a chaos-weighted draw from MIX_ENVS (generalist) or ENV_CLASS."""
+    if MIX_ENVS:
+        cls = MIX_ENVS[1] if rng.random() < MIX_CHAOS_FRAC else MIX_ENVS[0]   # [0]=standard, [1]=chaos
+    else:
+        cls = ENV_CLASS
     return cls(seed=int(rng.integers(1 << 30)), points=points)
 
 
@@ -339,11 +343,13 @@ def _yardstick_env(net, env_cls):
 
 
 def yardstick(net):
-    # generalist: must score well on BOTH envs -> average the per-env yardsticks (keep-best on combined)
+    # generalist: score on BOTH envs, combined with the SAME chaos weighting as training
+    # (keep-best then favours the chaos arena, matching the priority).
     if MIX_ENVS:
-        a = _yardstick_env(net, MIX_ENVS[0])
-        b = _yardstick_env(net, MIX_ENVS[1])
-        return tuple((x + y) / 2 for x, y in zip(a, b))
+        a = _yardstick_env(net, MIX_ENVS[0])     # standard
+        b = _yardstick_env(net, MIX_ENVS[1])     # chaos
+        w = MIX_CHAOS_FRAC
+        return tuple((1 - w) * x + w * y for x, y in zip(a, b))
     return _yardstick_env(net, ENV_CLASS)
 
 
@@ -410,21 +416,25 @@ def main():
                          "speed). Saves to pong_chaos.pt / pong_chaos_best.pt and warm-starts from "
                          "pong.pt, so pong.pt / pong_best.pt (the standard-arena best) stay untouched")
     ap.add_argument("--both", action="store_true",
-                    help="train ONE 'ambivalent' generalist on a 50/50 mix of the standard and chaos "
-                         "envs. Saves to pong_both.pt / pong_both_best.pt (best by combined std+chaos "
-                         "score), warm-starts from pong.pt; pong.pt / pong_best.pt stay untouched")
+                    help="train ONE generalist on BOTH envs (chaos-weighted, see --chaos-frac). Saves to "
+                         "pong_both.pt / pong_both_best.pt (best by chaos-weighted std+chaos score); "
+                         "pong.pt / pong_best.pt / willem-cnn.pt stay untouched")
+    ap.add_argument("--chaos-frac", type=float, default=0.6,
+                    help="with --both: fraction of training (and eval weight) on the chaos env (default 0.6)")
     args = ap.parse_args()
 
     # ── env + save-path selection (each mode writes its OWN files -> no collision) ──
-    global ENV_CLASS, MIX_ENVS, SAVE, BEST
+    global ENV_CLASS, MIX_ENVS, MIX_CHAOS_FRAC, SAVE, BEST
     if args.both:
         from arena_chaos import ChaosPong
-        MIX_ENVS = [PongSym, ChaosPong]         # each rollout game drawn 50/50 from these
+        MIX_ENVS = [PongSym, ChaosPong]         # [0]=standard, [1]=chaos
+        MIX_CHAOS_FRAC = args.chaos_frac
         if SAVE == HERE / "pong.pt":            # only redirect the DEFAULT paths (tests can override)
             SAVE = HERE / "pong_both.pt"
         if BEST == HERE / "pong_best.pt":
             BEST = HERE / "pong_both_best.pt"
-        print(f"*** GENERALIST: 50/50 standard+chaos -> {SAVE.name} / {BEST.name} ***")
+        print(f"*** GENERALIST: {int((1-MIX_CHAOS_FRAC)*100)}/{int(MIX_CHAOS_FRAC*100)} standard/chaos "
+              f"-> {SAVE.name} / {BEST.name} ***")
     elif args.chaos:
         from arena_chaos import ChaosPong
         ENV_CLASS = ChaosPong
@@ -468,9 +478,13 @@ def main():
             distill(net, args.init_from, rng)
             opt = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)   # fresh optimizer after distill
             print("fresh pong + warm-start")
+        elif args.both and (HERE / "willem-cnn.pt").exists():
+            # FIRST generalist run: warm-start from willem-cnn.pt -- the current champion
+            # (best at BOTH arenas) -- and keep adapting via the chaos-weighted mix.
+            ck = torch.load(HERE / "willem-cnn.pt", map_location=DEVICE, weights_only=False)
+            net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+            print("GENERALIST warm-start: copied weights from willem-cnn.pt (read-only); curriculum starts fresh")
         elif args.both and (HERE / "pong.pt").exists():
-            # FIRST generalist run: warm-start from pong.pt -- the STRONGER standard model
-            # (it beats pong_best in both arenas) -- and adapt it to chaos via the 50/50 mix.
             ck = torch.load(HERE / "pong.pt", map_location=DEVICE, weights_only=False)
             net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
             print("GENERALIST warm-start: copied weights from pong.pt (read-only); curriculum starts fresh")

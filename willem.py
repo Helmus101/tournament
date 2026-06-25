@@ -49,9 +49,10 @@ BEST = HERE / "realpong_best.pt"     # best-ever model by the fixed-tracker yard
 # swaps in arena_chaos.ChaosPong with --chaos, writing realpong_chaos.pt / realpong_chaos_best.pt
 # so a chaos run never touches realpong.pt / realpong_best.pt.
 ENV_CLASS = PongSym
-# With --both, MIX_ENVS is the list of env classes each training episode is drawn from at
-# random (standard + chaos), so ONE generalist learns to play either arena.
+# With --both, MIX_ENVS = [standard, chaos] and each training episode is drawn from them with
+# P(chaos) = MIX_CHAOS_FRAC, so ONE generalist learns both arenas but PRIORITISES chaos.
 MIX_ENVS = None
+MIX_CHAOS_FRAC = 0.6        # share of training episodes (and eval weight) on chaos when --both
 
 
 # ── THE MODEL (used by the tournament; trained by main() below) ───────────────
@@ -357,21 +358,25 @@ def main():
                          "realpong_chaos.pt / realpong_chaos_best.pt and warm-starts from realpong.pt, "
                          "so realpong.pt / realpong_best.pt stay untouched")
     ap.add_argument("--both", action="store_true",
-                    help="train ONE generalist on a 50/50 mix of standard+chaos. Warm-starts from the "
-                         "AVERAGE of realpong_best.pt and realpong_chaos_best.pt; saves to realpong_both.pt "
-                         "/ realpong_both_best.pt (best by combined score). The source bests stay untouched")
+                    help="train ONE generalist on BOTH envs (chaos-weighted, see --chaos-frac). Warm-starts "
+                         "from the AVERAGE of realpong_best.pt and realpong_chaos_best.pt; saves to "
+                         "realpong_both.pt / realpong_both_best.pt. The source bests stay untouched")
+    ap.add_argument("--chaos-frac", type=float, default=0.6,
+                    help="with --both: fraction of episodes (and eval weight) on the chaos env (default 0.6)")
     args = ap.parse_args()
 
     # ── env + save-path selection (each mode writes its OWN files -> no collision) ──
-    global ENV_CLASS, MIX_ENVS, SAVE, BEST
+    global ENV_CLASS, MIX_ENVS, MIX_CHAOS_FRAC, SAVE, BEST
     if args.both:
         from arena_chaos import ChaosPong
-        MIX_ENVS = [PongSym, ChaosPong]         # each episode drawn 50/50 from these
+        MIX_ENVS = [PongSym, ChaosPong]         # [0]=standard, [1]=chaos
+        MIX_CHAOS_FRAC = args.chaos_frac
         if SAVE == HERE / "realpong.pt":        # only redirect the DEFAULT paths (tests can override)
             SAVE = HERE / "realpong_both.pt"
         if BEST == HERE / "realpong_best.pt":
             BEST = HERE / "realpong_both_best.pt"
-        print(f"*** GENERALIST: 50/50 standard+chaos -> {SAVE.name} / {BEST.name} ***")
+        print(f"*** GENERALIST: {int((1-MIX_CHAOS_FRAC)*100)}/{int(MIX_CHAOS_FRAC*100)} standard/chaos "
+              f"-> {SAVE.name} / {BEST.name} ***")
     elif args.chaos:
         from arena_chaos import ChaosPong
         ENV_CLASS = ChaosPong
@@ -535,8 +540,8 @@ def main():
                     opponent = opp_agent
                 else:                            # tracker: easy(laggy) -> hard(lag 0) ball-follower
                     opponent = TrackerAgent(lag=bf_lag(skill), seed=int(rng.integers(1 << 30)))
-            # generalist: draw this episode's env 50/50 from the mix (standard | chaos)
-            ep_env = MIX_ENVS[int(rng.integers(len(MIX_ENVS)))] if MIX_ENVS else None
+            # generalist: draw this episode's env chaos-weighted from the mix (standard | chaos)
+            ep_env = (MIX_ENVS[1] if rng.random() < MIX_CHAOS_FRAC else MIX_ENVS[0]) if MIX_ENVS else None
             t0 = time.perf_counter()
             xs, ups, rewards, sr, sl, hits, misses = play_episode(
                 net, opponent, int(rng.integers(1 << 30)), points, env_cls=ep_env)
@@ -619,10 +624,11 @@ def main():
 
             if episode % eval_every == 0:                    # keep the BEST-ever model (fixed yardstick)
                 t0 = time.perf_counter()
-                if MIX_ENVS:                                 # generalist: must be good at BOTH envs
-                    ws, cs = evaluate_vs_bf(net, env_cls=MIX_ENVS[0])
-                    wc, cc = evaluate_vs_bf(net, env_cls=MIX_ENVS[1])
-                    score = ((ws - 0.01 * cs) + (wc - 0.01 * cc)) / 2     # combined std+chaos
+                if MIX_ENVS:                                 # generalist: good at BOTH, chaos-weighted
+                    ws, cs = evaluate_vs_bf(net, env_cls=MIX_ENVS[0])    # standard
+                    wc, cc = evaluate_vs_bf(net, env_cls=MIX_ENVS[1])    # chaos
+                    w = MIX_CHAOS_FRAC
+                    score = (1 - w) * (ws - 0.01 * cs) + w * (wc - 0.01 * cc)   # chaos-weighted combined
                     detail = f"std win {ws*100:.0f}% | chaos win {wc*100:.0f}%"
                 else:
                     wr, conc = evaluate_vs_bf(net)
