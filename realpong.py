@@ -108,6 +108,13 @@ def bf_lag(skill):
     return max(0, int(round(LAG_EASY * frac)))
 
 
+def skill_for_lag(lag):
+    """Inverse of bf_lag: the skill that yields (about) this starting lag — used to start the
+    external/ball-follower ladder at a chosen lag instead of the easy end."""
+    frac = max(0.0, min(1.0, lag / LAG_EASY))
+    return round(SKILL_MAX - frac * (SKILL_MAX - SKILL_MIN), 4)
+
+
 # match-length curriculum tied to SKILL (not episodes), so the ramp to full 21-point
 # games is GUARANTEED to happen before the self-play graduation:
 #   random warm-up            -> 5-point  matches (fast, dense signal)
@@ -147,7 +154,8 @@ offense_coef  = 0.01       # OFFENSE shaping (on our return only): bonus for pla
                            # dense per-step defense signal. Raise it later to push offense.
 window        = 50         # win rate & accuracy over the last 50 games (was 100 -> advances ~2x faster)
 eval_every    = 100        # every N episodes, eval vs the FIXED lag-8 tracker and keep the best-ever model
-eval_games    = 16
+eval_games    = 8          # fixed-seed games (both sides) -> deterministic yardstick; 8 halves the
+                           # eval pause vs 16 while keeping the same per-game-averaged score scale
 
 # ── ball-follower difficulty ladder ──────────────────────────────────────────────
 # `skill` rises 0.50 -> 1.00 in +0.02 steps; bf_lag() maps it to the bf's reaction lag:
@@ -325,6 +333,15 @@ def main():
     ap.add_argument("--opponent-file", default=None,
                     help="train vs a FIXED external opponent, e.g. pong.py:pong_best.pt "
                          "(loads <file>.Agent(<weights>); skips tracker/selfplay curriculum)")
+    ap.add_argument("--selfplay", action="store_true",
+                    help="force SELF-PLAY now: spar a pool of frozen past selves (skips the rest "
+                         "of the tracker ladder); keeps current weights")
+    ap.add_argument("--ball-follower", action="store_true",
+                    help="train vs the ball-follower (tracker) at INCREASING difficulty (lag 24->0), "
+                         "21-pt games, NO self-play graduation; keeps current weights and realpong_best")
+    ap.add_argument("--start-lag", type=int, default=None,
+                    help="for --opponent-file: start the opponent's lag ladder at THIS lag "
+                         "(e.g. 5) instead of the easy end; it still climbs toward lag 0")
     args = ap.parse_args()
 
     # ── optional: external fixed opponent (e.g. pong_best) ─────────────────────
@@ -388,7 +405,12 @@ def main():
     # reaction lag that we progressively REMOVE (lag 24 -> 0) as we clear the win gate. Keeps
     # realpong's trained weights; lag 0 == full-strength external opponent.
     if external_opp is not None:
-        if mode == "external":
+        if args.start_lag is not None:       # explicit starting lag (e.g. --start-lag 5) -> overrides
+            mode, skill = "external", skill_for_lag(args.start_lag)
+            restore_window = None
+            print(f">>> external lag ladder starts at lag {bf_lag(skill)} "
+                  f"(skill {skill:.3f}) -> climbs toward lag 0")
+        elif mode == "external":
             print(f">>> external lag ladder resumed at skill {skill:.2f} (lag {bf_lag(skill)})")
         else:                                # switching INTO external from another curriculum
             mode, skill = "external", SKILL_MIN
@@ -410,8 +432,16 @@ def main():
                   f"(win {np.mean(recent_wins)*100:.1f}%) — keeps progress toward the next level")
     opt.zero_grad()
     start = episode
+    if args.ball_follower:                         # force the ball-follower ladder (no self-play)
+        mode, skill = "tracker", 0.86              # start here (lag 7) and climb to lag 0
+        recent.clear(); recent_wins.clear(); recent_hits.clear(); recent_misses.clear()
+        print(f">>> ball-follower ladder: tracker from skill {skill:.2f} (lag {bf_lag(skill)}) "
+              f"-> climbs to lag 0, NO self-play, 21-pt games")
+    elif args.selfplay:                            # forced self-play (overrides curriculum / external)
+        mode, skill = "selfplay", max(skill, SELFPLAY_AT_SKILL)
+        print(">>> forced SELF-PLAY: sparring a pool of frozen past selves")
     # resumed already AT/past the graduation skill (e.g. stuck at the top of the ladder) -> self-play now
-    if mode == "tracker" and skill >= SELFPLAY_AT_SKILL - 1e-9:
+    elif mode == "tracker" and skill >= SELFPLAY_AT_SKILL - 1e-9:
         mode = "selfplay"
         print(f">>> resumed at skill {skill:.2f} (>= {SELFPLAY_AT_SKILL}) -> SELF-PLAY now")
     print(f"training on PongSym (symmetric). opponent: {mode}. Ctrl-C to stop.")
@@ -500,6 +530,12 @@ def main():
                 elif mode == "random":
                     mode, skill = "tracker", SKILL_START; advanced = True
                     print(f">>> warm-up cleared -> easy ball-follower ladder begins at skill {skill:.2f}")
+                elif mode == "tracker" and args.ball_follower:   # ball-follower ladder: climb to lag 0, no self-play
+                    if skill < SKILL_MAX - 1e-9:
+                        skill = round(min(skill + SKILL_STEP, SKILL_MAX), 2); advanced = True
+                        print(f">>> difficulty up: bf skill -> {skill:.2f} (lag {bf_lag(skill)}, >=85% win)")
+                    else:
+                        print(">>> at hardest ball-follower (lag 0) — holding here")
                 elif mode == "tracker":                      # cleared the gate -> sharpen one notch
                     skill = round(skill + SKILL_STEP, 2); advanced = True
                     if skill >= SELFPLAY_AT_SKILL - 1e-9:    # REACHED the graduation skill -> spar self
