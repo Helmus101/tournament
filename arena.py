@@ -52,7 +52,8 @@ BALL_SPEED_MAX  = 5.0      # hard cap after acceleration
 BALL_ACCEL      = 1.08     # speed multiplier per paddle hit (rally gets faster each return)
 PADDLE_KICK     = 0.4      # fraction of paddle velocity added to ball vy on contact
 POINTS       = 21          # a game is first to POINTS
-MAX_STEPS    = 8000        # truncate if neither side reaches POINTS
+MAX_STEPS    = 200000      # effectively "play to 21": real games finish far below this; the cap is only
+                           # a backstop against a true infinite rally (e.g. dead-centre flat stalemate)
 
 
 class PongSym:
